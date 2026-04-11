@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""
+Alpaca Auto-Trading Bot
+Automated trading script that:
+- Gets top 3 stocks from market scan
+- Allocates equal capital to each
+- Uses 2:1 R:R strategy (5% target, 2.5% stop)
+- Implements 2% trailing stop when profitable
+- Rotates positions daily during market hours
+- Sends email notifications on all trades
+"""
+
+import os
+import sys
+import time
+import logging
+import smtplib
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import pandas as pd
+import yfinance as yf
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import (
+    ALPACA_ENDPOINT, ALPACA_KEY, ALPACA_SECRET,
+    SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_RECIPIENTS,
+    TOP_N_STOCKS, ALLOCATION_PERCENT,
+    TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAIL_STOP_PCT, TRAIL_ACTIVATION_PCT,
+    CHECK_INTERVAL_SECONDS,
+    MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
+    DRY_RUN_MODE, LOG_FILE, MARKET_TZ
+)
+from swing_trading_analyzer import MarketScanner, StockAnalyzer, TechnicalAnalyzer
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class EmailNotifier:
+    def __init__(self):
+        self.smtp_server = SMTP_SERVER
+        self.smtp_port = SMTP_PORT
+        self.smtp_user = SMTP_USER
+        self.smtp_password = SMTP_PASSWORD
+        self.recipients = EMAIL_RECIPIENTS
+    
+    def send_trade_email(self, subject, body):
+        if not self.smtp_user or not self.smtp_password:
+            logger.warning("Email not configured - SMTP credentials not set")
+            return False
+        
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = self.smtp_user
+            msg["To"] = ", ".join(self.recipients)
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+            
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.smtp_user, self.recipients, msg.as_string())
+            
+            logger.info(f"Email sent: {subject}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}")
+            return False
+    
+    def send_buy_notification(self, symbol, qty, price, position_value):
+        subject = f"[BUY] {symbol} - Position Opened"
+        body = f"""Trade Alert - BUY Order Executed
+
+Stock: {symbol}
+Quantity: {qty} shares
+Entry Price: ${price:.2f}
+Position Value: ${position_value:.2f}
+Allocation: {ALLOCATION_PERCENT*100:.1f}% of portfolio
+
+Strategy: Top {TOP_N_STOCKS} from market scan
+Take Profit: {TAKE_PROFIT_PCT*100:.1f}%
+Stop Loss: {STOP_LOSS_PCT*100:.1f}%
+Trailing Stop: {TRAIL_STOP_PCT*100:.1f}% (when profitable)
+
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
+"""
+        return self.send_trade_email(subject, body)
+    
+    def send_sell_notification(self, symbol, qty, entry_price, exit_price, pnl_pct, reason):
+        subject = f"[SELL] {symbol} - {reason}"
+        pnl_direction = "+" if pnl_pct > 0 else ""
+        body = f"""Trade Alert - SELL Order Executed
+
+Stock: {symbol}
+Quantity: {qty} shares
+Entry Price: ${entry_price:.2f}
+Exit Price: ${exit_price:.2f}
+P&L: {pnl_direction}{pnl_pct:.2f}%
+Reason: {reason}
+
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
+"""
+        return self.send_trade_email(subject, body)
+    
+    def send_daily_summary(self, positions, total_value, buying_power, next_rotation):
+        position_lines = []
+        total_pnl = 0
+        
+        for pos in positions:
+            pnl = pos.get('market_value', 0) - pos.get('cost_basis', 0)
+            pnl_pct = (pnl / pos.get('cost_basis', 1)) * 100 if pos.get('cost_basis', 0) > 0 else 0
+            total_pnl += pnl
+            position_lines.append(
+                f"  {pos['symbol']}: {pos['qty']} shares @ ${pos['current_price']:.2f} "
+                f"(P&L: {pnl_direction(pnl_pct)}{pnl_pct:.2f}%)"
+            )
+        
+        positions_text = "\n".join(position_lines) if position_lines else "  No open positions"
+        
+        subject = f"[SUMMARY] Daily Trading Summary - {datetime.now().strftime('%Y-%m-%d')}"
+        body = f"""Daily Trading Summary
+
+Open Positions:
+{positions_text}
+
+Total Portfolio Value: ${total_value:.2f}
+Available Buying Power: ${buying_power:.2f}
+Unrealized P&L: {pnl_direction(total_pnl)}${abs(total_pnl):.2f}
+
+Next Position Rotation: {next_rotation}
+
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
+"""
+        return self.send_trade_email(subject, body)
+
+
+def pnl_direction(pnl):
+    return "+" if pnl > 0 else ""
+
+
+class AlpacaClient:
+    def __init__(self):
+        self.base_url = ALPACA_ENDPOINT
+        self.key = ALPACA_KEY
+        self.secret = ALPACA_SECRET
+        self.headers = {
+            "APCA-API-KEY-ID": self.key,
+            "APCA-API-SECRET-KEY": self.secret
+        }
+    
+    def _request(self, method, endpoint, data=None):
+        import requests
+        url = f"{self.base_url}{endpoint}"
+        try:
+            if method == "GET":
+                resp = requests.get(url, headers=self.headers, timeout=30)
+            elif method == "POST":
+                resp = requests.post(url, json=data, headers=self.headers, timeout=30)
+            elif method == "DELETE":
+                resp = requests.delete(url, headers=self.headers, timeout=30)
+            else:
+                return None
+            resp.raise_for_status()
+            return resp.json() if resp.text else {}
+        except Exception as e:
+            logger.error(f"Alpaca API error: {e}")
+            return None
+    
+    def get_account(self):
+        return self._request("GET", "/account")
+    
+    def get_positions(self):
+        return self._request("GET", "/positions") or []
+    
+    def get_position(self, symbol):
+        positions = self.get_positions()
+        for pos in positions:
+            if pos.get('symbol') == symbol:
+                return pos
+        return None
+    
+    def get_open_orders(self):
+        return self._request("GET", "/orders") or []
+    
+    def cancel_all_orders(self):
+        orders = self.get_open_orders()
+        for order in orders:
+            self._request("DELETE", f"/orders/{order['id']}")
+    
+    def place_market_order(self, symbol, qty, side):
+        data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": side,
+            "type": "market",
+            "time_in_force": "day"
+        }
+        if DRY_RUN_MODE:
+            logger.info(f"[DRY RUN] Would place {side} order: {symbol} x{qty}")
+            return {"id": "dry_run", "status": "ok"}
+        return self._request("POST", "/orders", data)
+    
+    def place_limit_order(self, symbol, qty, side, limit_price):
+        data = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": side,
+            "type": "limit",
+            "limit_price": str(limit_price),
+            "time_in_force": "day"
+        }
+        if DRY_RUN_MODE:
+            logger.info(f"[DRY RUN] Would place {side} limit order: {symbol} x{qty} @ ${limit_price}")
+            return {"id": "dry_run", "status": "ok"}
+        return self._request("POST", "/orders", data)
+    
+    def close_position(self, symbol):
+        if DRY_RUN_MODE:
+            logger.info(f"[DRY RUN] Would close position: {symbol}")
+            return {"id": "dry_run", "status": "ok"}
+        return self._request("DELETE", f"/positions/{symbol}")
+
+
+class MarketScanReader:
+    def __init__(self):
+        self.ta = TechnicalAnalyzer()
+    
+    def run_scan(self, top_n=15):
+        logger.info(f"Running market scan for top {top_n} stocks...")
+        
+        from swing_trading_analyzer import MarketScanner, StockAnalyzer, SP500_TICKERS
+        
+        analyzer = StockAnalyzer(symbols=SP500_TICKERS[:50], period="2wk", interval="1h")
+        scanner = MarketScanner(analyzer)
+        
+        results = scanner.full_market_scan(top_n=top_n)
+        
+        logger.info(f"Scan complete: found {len(results['all_symbols'])} candidates")
+        
+        return results
+    
+    def get_top_buy_stocks(self, top_n=3):
+        results = self.run_scan(top_n=TOP_N_STOCKS + 5)
+        
+        candidates = []
+        
+        for symbol in results.get('all_symbols', [])[:TOP_N_STOCKS * 2]:
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                
+                if info.get('regularMarketPrice') and info.get('regularMarketPrice') > 1:
+                    current_price = info.get('regularMarketPrice')
+                    
+                    candidates.append({
+                        'symbol': symbol,
+                        'price': current_price,
+                        'volume': info.get('volume', 0),
+                        'avg_volume': info.get('averageVolume', 0),
+                    })
+            except Exception as e:
+                logger.debug(f"Could not fetch {symbol}: {e}")
+                continue
+        
+        candidates.sort(key=lambda x: x['volume'], reverse=True)
+        
+        top_stocks = candidates[:top_n]
+        
+        logger.info(f"Selected top {len(top_stocks)} stocks: {[s['symbol'] for s in top_stocks]}")
+        
+        return top_stocks
+
+
+class TradingStrategy:
+    def __init__(self):
+        self.take_profit_pct = TAKE_PROFIT_PCT
+        self.stop_loss_pct = STOP_LOSS_PCT
+        self.trail_stop_pct = TRAIL_STOP_PCT
+        self.trail_activation_pct = TRAIL_ACTIVATION_PCT
+    
+    def calculate_position_sizes(self, buying_power, stock_prices):
+        total_capital = buying_power * len(stock_prices)
+        sizes = []
+        
+        for price in stock_prices:
+            qty = int((total_capital / len(stock_prices)) / price)
+            qty = (qty // 1) * 1
+            sizes.append(max(1, qty))
+        
+        return sizes
+    
+    def get_exit_prices(self, entry_price):
+        take_profit = entry_price * (1 + self.take_profit_pct)
+        stop_loss = entry_price * (1 - self.stop_loss_pct)
+        
+        return {
+            'entry': entry_price,
+            'take_profit': take_profit,
+            'stop_loss': stop_loss
+        }
+    
+    def should_exit(self, current_price, entry_price, peak_price, current_position):
+        entry = entry_price
+        pnl_pct = (current_price - entry) / entry
+        
+        if pnl_pct >= self.take_profit_pct:
+            return True, "Take Profit Target"
+        
+        if pnl_pct <= -self.stop_loss_pct:
+            return True, "Stop Loss"
+        
+        if current_position.get('trailing_active', False):
+            trail_price = peak_price * (1 - self.trail_stop_pct)
+            if current_price <= trail_price:
+                return True, "Trailing Stop"
+        
+        return False, None
+    
+    def activate_trailing(self, current_price, entry_price, position_data):
+        pnl_pct = (current_price - entry_price) / entry_price
+        
+        if pnl_pct >= self.trail_activation_pct:
+            position_data['trailing_active'] = True
+            position_data['peak_price'] = max(
+                position_data.get('peak_price', current_price),
+                current_price
+            )
+        
+        return position_data
+
+
+class TradingBot:
+    def __init__(self):
+        self.alpaca = AlpacaClient()
+        self.scanner = MarketScanReader()
+        self.strategy = TradingStrategy()
+        self.email = EmailNotifier()
+        self.positions = {}
+        self.last_rotation_date = None
+    
+    def is_market_open(self):
+        from datetime import time as dt_time
+        from config import RUN_TEST_MODE
+        
+        if RUN_TEST_MODE:
+            return True  # Bypass market hours for testing
+        
+        now = datetime.now()
+        current_time = now.time()
+        
+        open_time = dt_time(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE)
+        close_time = dt_time(MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE)
+        
+        if now.weekday() >= 5:
+            return False
+        
+        return open_time <= current_time <= close_time
+    
+    def should_rotate(self):
+        from config import RUN_TEST_MODE
+        
+        if RUN_TEST_MODE:
+            return True  # Allow rotation anytime in test mode
+        
+        today = datetime.now().date()
+        
+        if self.last_rotation_date != today:
+            if self.is_market_open():
+                return True
+        
+        return False
+    
+    def get_account_info(self):
+        account = self.alpaca.get_account()
+        if not account:
+            return None, None
+        
+        buying_power = float(account.get('buying_power', 0))
+        portfolio_value = float(account.get('portfolio_value', buying_power))
+        
+        return buying_power, portfolio_value
+    
+    def load_positions(self):
+        from config import DRY_RUN_MODE
+        
+        alpaca_positions = self.alpaca.get_positions()
+        
+        if DRY_RUN_MODE:
+            return
+        
+        if not alpaca_positions:
+            self.positions = {}
+            return
+        
+        self.positions = {}
+        for pos in alpaca_positions:
+            symbol = pos.get('symbol')
+            self.positions[symbol] = {
+                'symbol': symbol,
+                'qty': int(float(pos.get('qty', 0))),
+                'avg_entry_price': float(pos.get('avg_entry_price', 0)),
+                'current_price': float(pos.get('current_price', 0)),
+                'market_value': float(pos.get('market_value', 0)),
+                'cost_basis': float(pos.get('cost_basis', 0)),
+                'unrealized_pl': float(pos.get('unrealized_pl', 0)),
+                'trailing_active': False,
+                'peak_price': float(pos.get('current_price', 0))
+            }
+    
+    def close_all_positions(self):
+        logger.info("Closing all positions...")
+        
+        for symbol in list(self.positions.keys()):
+            pos = self.positions[symbol]
+            
+            result = self.alpaca.close_position(symbol)
+            
+            entry_price = pos['avg_entry_price']
+            exit_price = pos['current_price']
+            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+            
+            self.email.send_sell_notification(
+                symbol, pos['qty'], entry_price, exit_price, pnl_pct, "Daily Rotation"
+            )
+            
+            logger.info(f"Closed {symbol}: P&L = {pnl_pct:.2f}%")
+        
+        self.positions = {}
+        self.alpaca.cancel_all_orders()
+    
+    def open_positions(self, symbols):
+        logger.info(f"Opening positions in: {symbols}")
+        
+        buying_power, portfolio_value = self.get_account_info()
+        
+        if not buying_power or buying_power <= 0:
+            logger.warning("No buying power available")
+            return
+        
+        allocation = (buying_power * ALLOCATION_PERCENT)
+        
+        stock_data = []
+        
+        for symbol in symbols:
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                
+                if info and info.get('regularMarketPrice'):
+                    stock_data.append({
+                        'symbol': symbol,
+                        'price': info['regularMarketPrice']
+                    })
+            except Exception as e:
+                logger.error(f"Failed to get price for {symbol}: {e}")
+                continue
+        
+        if len(stock_data) < len(symbols):
+            logger.warning(f"Only got {len(stock_data)}/{len(symbols)} stock prices")
+        
+        for stock in stock_data:
+            symbol = stock['symbol']
+            price = stock['price']
+            
+            qty = int(allocation / price)
+            
+            if qty <= 0:
+                logger.warning(f"Cannot buy {symbol}: allocation too small")
+                continue
+            
+            result = self.alpaca.place_market_order(symbol, qty, "buy")
+            
+            self.positions[symbol] = {
+                'symbol': symbol,
+                'qty': qty,
+                'avg_entry_price': price,
+                'current_price': price,
+                'market_value': qty * price,
+                'cost_basis': qty * price,
+                'unrealized_pl': 0,
+                'trailing_active': False,
+                'peak_price': price
+            }
+            
+            self.email.send_buy_notification(symbol, qty, price, qty * price)
+            
+            logger.info(f"Opened {symbol}: {qty} shares at ${price}")
+    
+    def rotate_positions(self):
+        logger.info("Running daily position rotation...")
+        
+        self.close_all_positions()
+        
+        top_stocks = self.scanner.get_top_buy_stocks(top_n=TOP_N_STOCKS)
+        
+        symbols = [s['symbol'] for s in top_stocks]
+        
+        self.open_positions(symbols)
+        
+        self.last_rotation_date = datetime.now().date()
+        
+        logger.info(f"Rotation complete. New positions: {symbols}")
+    
+    def monitor_positions(self):
+        logger.info("Monitoring positions...")
+        
+        self.load_positions()
+        
+        if not self.positions:
+            logger.info("No open positions")
+            return
+        
+        for symbol, pos in list(self.positions.items()):
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                
+                if not info or not info.get('regularMarketPrice'):
+                    continue
+                
+                current_price = info['regularMarketPrice']
+                
+                pos['current_price'] = current_price
+                pos['market_value'] = pos['qty'] * current_price
+                
+                peak = pos.get('peak_price', current_price)
+                if current_price > peak:
+                    pos['peak_price'] = current_price
+                
+                self.strategy.activate_trailing(
+                    current_price, pos['avg_entry_price'], pos
+                )
+                
+                should_exit, reason = self.strategy.should_exit(
+                    current_price, pos['avg_entry_price'], pos['peak_price'], pos
+                )
+                
+                if should_exit:
+                    logger.info(f"Exiting {symbol}: {reason}")
+                    
+                    result = self.alpaca.close_position(symbol)
+                    
+                    entry_price = pos['avg_entry_price']
+                    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                    
+                    self.email.send_sell_notification(
+                        symbol, pos['qty'], entry_price, current_price, pnl_pct, reason
+                    )
+                    
+                    del self.positions[symbol]
+                    
+                    logger.info(f"Closed {symbol}: {reason} at ${current_price}, P&L = {pnl_pct:.2f}%")
+            
+            except Exception as e:
+                logger.error(f"Error monitoring {symbol}: {e}")
+                continue
+    
+    def run(self):
+        logger.info("Starting trading bot...")
+        logger.info(f"Dry run mode: {DRY_RUN_MODE}")
+        
+        while True:
+            try:
+                if self.should_rotate():
+                    logger.info("Market open - rotating positions")
+                    self.rotate_positions()
+                
+                if self.is_market_open():
+                    self.monitor_positions()
+                else:
+                    logger.info("Market closed - waiting")
+                
+                time.sleep(CHECK_INTERVAL_SECONDS)
+            
+            except KeyboardInterrupt:
+                logger.info("Shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Error: {e}")
+                time.sleep(60)
+
+
+def main():
+    print("\n" + "=" * 60)
+    print("ALPACA AUTO-TRADING BOT")
+    print("=" * 60)
+    
+    print(f"\nConfiguration:")
+    print(f"  Top N Stocks: {TOP_N_STOCKS}")
+    print(f"  Allocation per stock: {ALLOCATION_PERCENT*100:.1f}%")
+    print(f"  Take Profit: {TAKE_PROFIT_PCT*100:.1f}%")
+    print(f"  Stop Loss: {STOP_LOSS_PCT*100:.1f}%")
+    print(f"  Trailing Stop: {TRAIL_STOP_PCT*100:.1f}%")
+    print(f"  Check Interval: {CHECK_INTERVAL_SECONDS/60:.0f} minutes")
+    print(f"  Market Hours: {MARKET_OPEN_HOUR}:{MARKET_OPEN_MINUTE:02d} - {MARKET_CLOSE_HOUR}:{MARKET_CLOSE_MINUTE:02d} ET")
+    print(f"  Dry Run Mode: {DRY_RUN_MODE}")
+    
+    if DRY_RUN_MODE:
+        print("\n*** DRY RUN MODE ENABLED - NO REAL TRADES ***")
+        print("Set DRY_RUN_MODE = False in config.py to enable live trading")
+    
+    print("\n" + "=" * 60)
+    
+    bot = TradingBot()
+    bot.run()
+
+
+if __name__ == "__main__":
+    main()
