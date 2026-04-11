@@ -35,6 +35,6 @@ MARKET_CLOSE_MINUTE = 0
 DRY_RUN_MODE = False
 RUN_TEST_MODE = False
 
-LOG_FILE = "trading_log.txt"
+LOG_FILE = "/var/log/alpaca_trading.log"
 
 MARKET_TZ = "America/New_York"

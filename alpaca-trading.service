@@ -1,0 +1,21 @@
+[Unit]
+Description=Alpaca Auto-Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/alau/autotrading
+ExecStart=/home/alau/autotrading/venv/bin/python3 /home/alau/autotrading/alpaca_trading_bot.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alpaca_trading
+
+Restart=on-failure
+RestartSec=10
+
+Environment="PATH=/home/alau/autotrading/venv/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/home/alau/autotrading"
+
+[Install]
+WantedBy=multi-user.target
