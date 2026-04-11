@@ -6,9 +6,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ALPACA_ENDPOINT = os.environ.get("ALPACA_PAPER_ENDPOINT", "https://paper-api.alpaca.markets/v2")
-ALPACA_KEY = os.environ.get("ALPACA_PAPER_KEY", "")
-ALPACA_SECRET = os.environ.get("ALPACA_PAPER_SECRETE", "")
+ALPACA_ENDPOINT = os.environ.get("ALPACA_ENDPOINT", "https://api.alpaca.markets/v2")
+ALPACA_KEY = os.environ.get("ALPACA_KEY", "")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
 
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))

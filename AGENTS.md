@@ -46,7 +46,7 @@ In `venv/`, installed from `requirements.txt`:
 ## API Keys
 
  Loaded from `.env` file:
-- Alpaca: `ALPACA_PAPER_KEY`, `ALPACA_PAPER_SECRETE`, `ALPACA_PAPER_ENDPOINT`
+- Alpaca: `ALPACA_KEY`, `ALPACA_SECRET`, `ALPACA_ENDPOINT`
 - Email: `SMTP_USER`, `SMTP_PASSWORD`
 
 ## Strategy (alpaca_trading_bot.py)
