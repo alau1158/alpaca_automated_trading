@@ -328,12 +328,24 @@ class MarketScanReader:
         return results
     
     def get_top_buy_stocks(self, top_n=3):
-        results = self.run_scan(top_n=TOP_N_STOCKS + 5)
+        results = self.run_scan(top_n=TOP_N_STOCKS * 5)
         
         candidates = []
+        from swing_trading_analyzer import StockAnalyzer
+        analyzer = StockAnalyzer(symbols=[], period="2wk", interval="1h")
         
-        for symbol in results.get('all_symbols', [])[:TOP_N_STOCKS * 2]:
+        for symbol in results.get('all_symbols', []):
             try:
+                # Perform technical analysis to confirm BUY signal
+                analysis = analyzer.analyze_stock(symbol)
+                if not analysis:
+                    continue
+                
+                rec = analysis['recommendation']
+                # Only consider stocks with BUY or STRONG BUY signals
+                if rec['recommendation'] not in ["BUY", "STRONG BUY"]:
+                    continue
+
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
                 
@@ -344,13 +356,15 @@ class MarketScanReader:
                         'symbol': symbol,
                         'price': current_price,
                         'volume': info.get('volume', 0),
-                        'avg_volume': info.get('averageVolume', 0),
+                        'strength': rec['strength'],
+                        'recommendation': rec['recommendation']
                     })
             except Exception as e:
-                logger.debug(f"Could not fetch {symbol}: {e}")
+                logger.debug(f"Could not fetch/analyze {symbol}: {e}")
                 continue
         
-        candidates.sort(key=lambda x: x['volume'], reverse=True)
+        # Sort by signal strength first, then volume
+        candidates.sort(key=lambda x: (x['strength'], x['volume']), reverse=True)
         
         top_stocks = candidates[:top_n]
         
@@ -391,16 +405,19 @@ class TradingStrategy:
         entry = entry_price
         pnl_pct = (current_price - entry) / entry
         
-        if pnl_pct >= self.take_profit_pct:
-            return True, "Take Profit Target"
-        
+        # Stop Loss (Hard exit)
         if pnl_pct <= -self.stop_loss_pct:
             return True, "Stop Loss"
         
+        # Trailing Stop logic
         if current_position.get('trailing_active', False):
             trail_price = peak_price * (1 - self.trail_stop_pct)
             if current_price <= trail_price:
-                return True, "Trailing Stop"
+                return True, f"Trailing Stop (Profit: {pnl_pct*100:.2f}%)"
+        
+        # If we hit take profit but trailing isn't active yet, 
+        # normally we'd exit, but user wants trailing past 5%.
+        # The activate_trailing method handles setting trailing_active.
         
         return False, None
     
@@ -434,10 +451,11 @@ class TradingBot:
     def check_pdt_protection(self):
         buying_power, portfolio_value = self.get_account_info()
         
-        if portfolio_value and portfolio_value >= self.PDT_THRESHOLD:
+        if portfolio_value is not None and portfolio_value >= self.PDT_THRESHOLD:
             return True, "Account value sufficient for day trading"
         
-        return False, f"Account value ${portfolio_value:.2f} below $25,000 PDT threshold"
+        val_str = f"${portfolio_value:.2f}" if portfolio_value is not None else "Unknown"
+        return False, f"Account value {val_str} below $25,000 PDT threshold"
     
     def record_day_trade(self, symbol):
         today = datetime.now().date()
@@ -566,11 +584,12 @@ class TradingBot:
         
         buying_power, portfolio_value = self.get_account_info()
         
-        if not buying_power or buying_power <= 0:
-            logger.warning("No buying power available")
+        if portfolio_value is None or buying_power is None or buying_power <= 0:
+            logger.warning(f"Insufficient account info or buying power (BP: {buying_power})")
             return
         
-        remaining_allocation = buying_power * ALLOCATION_PERCENT
+        # Each stock should get ALLOCATION_PERCENT of the portfolio
+        target_per_stock = portfolio_value * ALLOCATION_PERCENT
         
         stock_data = []
         
@@ -588,20 +607,17 @@ class TradingBot:
                 logger.error(f"Failed to get price for {symbol}: {e}")
                 continue
         
-        if len(stock_data) < len(symbols):
-            logger.warning(f"Only got {len(stock_data)}/{len(symbols)} stock prices")
-        
         for stock in stock_data:
             symbol = stock['symbol']
             price = stock['price']
             
-            num_positions = len(stock_data) if stock_data else 1
-            allocation = remaining_allocation / num_positions
+            # Check if we have enough buying power for this specific allocation
+            allocation = min(target_per_stock, buying_power / len(stock_data))
             
             qty = int(allocation / price)
             
             if qty <= 0:
-                logger.warning(f"Cannot buy {symbol}: allocation too small")
+                logger.warning(f"Cannot buy {symbol}: allocation too small (Target: ${allocation:.2f}, Price: ${price:.2f})")
                 continue
             
             result = self.alpaca.place_market_order(symbol, qty, "buy")
@@ -627,6 +643,12 @@ class TradingBot:
         logger.info("Running daily position rotation...")
         
         self.close_all_positions()
+        
+        # Reload positions to see if they actually closed
+        self.load_positions()
+        if self.positions:
+            logger.warning(f"Could not close all positions ({list(self.positions.keys())}). Aborting rotation to avoid over-leverage.")
+            return
         
         top_stocks = self.scanner.get_top_buy_stocks(top_n=TOP_N_STOCKS)
         
