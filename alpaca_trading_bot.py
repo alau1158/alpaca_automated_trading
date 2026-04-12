@@ -139,7 +139,7 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
 """
         return self.send_trade_email(subject, body)
     
-    def send_daily_summary(self, positions, total_value, buying_power, next_rotation):
+    def send_daily_summary(self, positions, total_value, cash, next_rotation):
         position_lines = []
         total_pnl = 0
         
@@ -161,7 +161,7 @@ Open Positions:
 {positions_text}
 
 Total Portfolio Value: ${total_value:.2f}
-Available Buying Power: ${buying_power:.2f}
+Available Cash: ${cash:.2f}
 Unrealized P&L: {pnl_direction(total_pnl)}${abs(total_pnl):.2f}
 
 Next Position Rotation: {next_rotation}
@@ -318,7 +318,7 @@ class MarketScanReader:
         
         from swing_trading_analyzer import MarketScanner, StockAnalyzer, SP500_TICKERS
         
-        analyzer = StockAnalyzer(symbols=SP500_TICKERS[:50], period="2wk", interval="1h")
+        analyzer = StockAnalyzer(symbols=SP500_TICKERS[:50], period="1mo", interval="30m")
         scanner = MarketScanner(analyzer)
         
         results = scanner.full_market_scan(top_n=top_n)
@@ -332,7 +332,7 @@ class MarketScanReader:
         
         candidates = []
         from swing_trading_analyzer import StockAnalyzer
-        analyzer = StockAnalyzer(symbols=[], period="2wk", interval="1h")
+        analyzer = StockAnalyzer(symbols=[], period="1mo", interval="30m")
         
         for symbol in results.get('all_symbols', []):
             try:
@@ -380,8 +380,8 @@ class TradingStrategy:
         self.trail_stop_pct = TRAIL_STOP_PCT
         self.trail_activation_pct = TRAIL_ACTIVATION_PCT
     
-    def calculate_position_sizes(self, buying_power, stock_prices):
-        total_capital = buying_power * len(stock_prices)
+    def calculate_position_sizes(self, cash, stock_prices):
+        total_capital = cash * len(stock_prices)
         sizes = []
         
         for price in stock_prices:
@@ -449,7 +449,7 @@ class TradingBot:
     PDT_THRESHOLD = 25000
     
     def check_pdt_protection(self):
-        buying_power, portfolio_value = self.get_account_info()
+        cash, portfolio_value = self.get_account_info()
         
         if portfolio_value is not None and portfolio_value >= self.PDT_THRESHOLD:
             return True, "Account value sufficient for day trading"
@@ -506,10 +506,10 @@ class TradingBot:
         if not account:
             return None, None
         
-        buying_power = float(account.get('buying_power', 0))
-        portfolio_value = float(account.get('portfolio_value', buying_power))
+        cash = float(account.get('cash', 0))
+        portfolio_value = float(account.get('portfolio_value', cash))
         
-        return buying_power, portfolio_value
+        return cash, portfolio_value
     
     def load_positions(self):
         from config import DRY_RUN_MODE
@@ -582,10 +582,10 @@ class TradingBot:
             logger.info("All target stocks already owned - no new positions to open")
             return
         
-        buying_power, portfolio_value = self.get_account_info()
+        cash, portfolio_value = self.get_account_info()
         
-        if portfolio_value is None or buying_power is None or buying_power <= 0:
-            logger.warning(f"Insufficient account info or buying power (BP: {buying_power})")
+        if portfolio_value is None or cash is None or cash <= 0:
+            logger.warning(f"Insufficient cash (Cash: ${cash:.2f})")
             return
         
         # Each stock should get ALLOCATION_PERCENT of the portfolio
@@ -611,8 +611,8 @@ class TradingBot:
             symbol = stock['symbol']
             price = stock['price']
             
-            # Check if we have enough buying power for this specific allocation
-            allocation = min(target_per_stock, buying_power / len(stock_data))
+            # Check if we have enough cash for this specific allocation
+            allocation = min(target_per_stock, cash / len(stock_data))
             
             qty = int(allocation / price)
             
@@ -743,9 +743,9 @@ class TradingBot:
         if not self.is_market_open():
             return
         
-        buying_power, portfolio_value = self.get_account_info()
+        cash, portfolio_value = self.get_account_info()
         
-        if not buying_power or buying_power <= 0:
+        if not cash or cash <= 0:
             return
         
         reentry_symbols = list(self.stopped_positions.keys())
@@ -768,7 +768,7 @@ class TradingBot:
                 reentry_threshold = entry_price * (1 + REENTRY_BUFFER_PCT)
                 
                 if current_price >= reentry_threshold:
-                    allocation = buying_power * ALLOCATION_PERCENT
+                    allocation = cash * ALLOCATION_PERCENT
                     qty = int(allocation / current_price)
                     
                     if qty <= 0:
@@ -810,9 +810,9 @@ class TradingBot:
         needed = TOP_N_STOCKS - len(self.positions)
         logger.info(f"Rebalancing: need {needed} more stock(s) to reach {TOP_N_STOCKS}")
         
-        buying_power, portfolio_value = self.get_account_info()
-        if not buying_power or buying_power <= 0:
-            logger.warning("No buying power for rebalancing")
+        cash, portfolio_value = self.get_account_info()
+        if not cash or cash <= 0:
+            logger.warning("No cash for rebalancing")
             return
         
         top_stocks = self.scanner.get_top_buy_stocks(top_n=needed + len(self.positions))
@@ -835,10 +835,10 @@ class TradingBot:
                 
                 current_price = info['regularMarketPrice']
                 
-                qty = int(buying_power / current_price)
+                qty = int(cash / current_price)
                 
                 if qty <= 0:
-                    logger.warning(f"Cannot buy {symbol}: insufficient funds (${buying_power:.2f}, price: ${current_price:.2f})")
+                    logger.warning(f"Cannot buy {symbol}: insufficient funds (${cash:.2f}, price: ${current_price:.2f})")
                     continue
                 
                 result = self.alpaca.place_market_order(symbol, qty, "buy")
@@ -860,7 +860,7 @@ class TradingBot:
                 
                 logger.info(f"Rebalanced: Opened {symbol} - {qty} shares at ${current_price}")
                 
-                buying_power -= qty * current_price
+                cash -= qty * current_price
                 
                 if len(self.positions) >= TOP_N_STOCKS:
                     break

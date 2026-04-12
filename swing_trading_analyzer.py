@@ -1229,7 +1229,7 @@ def main():
     print("\n" + "=" * 80)
     
     # Initialize analyzer
-    analyzer = StockAnalyzer(period="2wk", interval="1h")
+    analyzer = StockAnalyzer(period="1mo", interval="30m")
     
     # Analyze all stocks
     analyzer.analyze_all()

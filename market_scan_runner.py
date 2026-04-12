@@ -57,7 +57,7 @@ def generate_market_scan_report(output_file="market_scan_report.txt"):
     print(f"MARKET SCAN REPORT - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*80}")
     
-    analyzer = StockAnalyzer(symbols=[], period="2wk", interval="1h")
+    analyzer = StockAnalyzer(symbols=[], period="1mo", interval="30m")
     scanner = MarketScanner(analyzer)
     
     results = scanner.full_market_scan(top_n=15)
