@@ -13,6 +13,7 @@ Automated trading script that:
 import os
 import sys
 import time
+import csv
 import logging
 import smtplib
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from config import (
     SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_RECIPIENTS,
     TOP_N_STOCKS, ALLOCATION_PERCENT,
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAIL_STOP_PCT, TRAIL_ACTIVATION_PCT,
+    REENTRY_ENABLED, REENTRY_BUFFER_PCT,
     CHECK_INTERVAL_SECONDS,
     MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
     DRY_RUN_MODE, LOG_FILE, MARKET_TZ
@@ -116,6 +118,27 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
 """
         return self.send_trade_email(subject, body)
     
+    def send_reentry_notification(self, symbol, qty, price, position_value, original_entry_price):
+        subject = f"[RE-ENTRY] {symbol} - Position Re-Opened"
+        body = f"""Trade Alert - RE-ENTRY BUY Order Executed
+
+Stock: {symbol}
+Quantity: {qty} shares
+Re-Entry Price: ${price:.2f}
+Position Value: ${position_value:.2f}
+Allocation: {ALLOCATION_PERCENT*100:.1f}% of portfolio
+
+Original Entry Price: ${original_entry_price:.2f}
+Recovery: {((price - original_entry_price) / original_entry_price * 100):.2f}%
+
+Strategy: Re-entry on recovery (1% buffer above original entry)
+Take Profit: {TAKE_PROFIT_PCT*100:.1f}%
+Stop Loss: {STOP_LOSS_PCT*100:.1f}%
+
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
+"""
+        return self.send_trade_email(subject, body)
+    
     def send_daily_summary(self, positions, total_value, buying_power, next_rotation):
         position_lines = []
         total_pnl = 0
@@ -146,6 +169,57 @@ Next Position Rotation: {next_rotation}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
 """
         return self.send_trade_email(subject, body)
+
+
+class JournalLogger:
+    def __init__(self, journal_path="/home/alau/autotrading/journal.csv"):
+        self.journal_path = journal_path
+    
+    def _format_date(self, dt):
+        return dt.strftime("%Y%m%d")
+    
+    def log_buy(self, symbol, quantity, price):
+        try:
+            with open(self.journal_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    symbol.upper(),
+                    quantity,
+                    self._format_date(datetime.now()),
+                    f"{price:.2f}",
+                    "",
+                    ""
+                ])
+            logger.info(f"Journal: Logged BUY {symbol}")
+        except Exception as e:
+            logger.error(f"Failed to log buy to journal: {e}")
+    
+    def log_sell(self, symbol, sold_price):
+        try:
+            with open(self.journal_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            
+            for row in rows:
+                row = {k.strip(): v for k, v in row.items()}
+                if row.get("ticket", "").upper() == symbol.upper() and not row.get("sold_date", "").strip():
+                    row["sold_date"] = self._format_date(datetime.now())
+                    row["sold_price"] = f"{sold_price:.2f}"
+                    
+                    with open(self.journal_path, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=["ticket", "quanity", "bought_date", "bought_price", "sold_date", "sold_price"])
+                        writer.writeheader()
+                        for r in rows:
+                            writer.writerow(r)
+                    logger.info(f"Journal: Logged SELL {symbol}")
+                    return
+            
+            logger.warning(f"No open position found for {symbol} in journal")
+        except Exception as e:
+            logger.error(f"Failed to log sell to journal: {e}")
+    
+    def log_reentry(self, symbol, quantity, price):
+        self.log_buy(symbol, quantity, price)
 
 
 def pnl_direction(pnl):
@@ -349,7 +423,9 @@ class TradingBot:
         self.scanner = MarketScanReader()
         self.strategy = TradingStrategy()
         self.email = EmailNotifier()
+        self.journal = JournalLogger()
         self.positions = {}
+        self.stopped_positions = {}  # Track exited positions for re-entry
         self.last_rotation_date = None
     
     def is_market_open(self):
@@ -436,6 +512,7 @@ class TradingBot:
             self.email.send_sell_notification(
                 symbol, pos['qty'], entry_price, exit_price, pnl_pct, "Daily Rotation"
             )
+            self.journal.log_sell(symbol, exit_price)
             
             logger.info(f"Closed {symbol}: P&L = {pnl_pct:.2f}%")
         
@@ -497,6 +574,7 @@ class TradingBot:
             }
             
             self.email.send_buy_notification(symbol, qty, price, qty * price)
+            self.journal.log_buy(symbol, qty, price)
             
             logger.info(f"Opened {symbol}: {qty} shares at ${price}")
     
@@ -555,18 +633,96 @@ class TradingBot:
                     result = self.alpaca.close_position(symbol)
                     
                     entry_price = pos['avg_entry_price']
-                    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                    exit_price = current_price
+                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                     
                     self.email.send_sell_notification(
-                        symbol, pos['qty'], entry_price, current_price, pnl_pct, reason
+                        symbol, pos['qty'], entry_price, exit_price, pnl_pct, reason
                     )
+                    self.journal.log_sell(symbol, exit_price)
+                    
+                    if REENTRY_ENABLED:
+                        self.stopped_positions[symbol] = {
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'exit_time': datetime.now(),
+                            'stop_reason': reason
+                        }
+                        logger.info(f"Tracking {symbol} for re-entry at ${entry_price}")
                     
                     del self.positions[symbol]
                     
-                    logger.info(f"Closed {symbol}: {reason} at ${current_price}, P&L = {pnl_pct:.2f}%")
+                    logger.info(f"Closed {symbol}: {reason} at ${exit_price}, P&L = {pnl_pct:.2f}%")
             
             except Exception as e:
                 logger.error(f"Error monitoring {symbol}: {e}")
+                continue
+    
+    def check_reentry(self):
+        if not REENTRY_ENABLED:
+            return
+        
+        if not self.stopped_positions:
+            return
+        
+        if not self.is_market_open():
+            return
+        
+        buying_power, portfolio_value = self.get_account_info()
+        
+        if not buying_power or buying_power <= 0:
+            return
+        
+        reentry_symbols = list(self.stopped_positions.keys())
+        
+        for symbol in reentry_symbols:
+            if symbol in self.positions:
+                del self.stopped_positions[symbol]
+                continue
+            
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                
+                if not info or not info.get('regularMarketPrice'):
+                    continue
+                
+                current_price = info['regularMarketPrice']
+                entry_price = self.stopped_positions[symbol]['entry_price']
+                
+                reentry_threshold = entry_price * (1 + REENTRY_BUFFER_PCT)
+                
+                if current_price >= reentry_threshold:
+                    allocation = buying_power * ALLOCATION_PERCENT
+                    qty = int(allocation / current_price)
+                    
+                    if qty <= 0:
+                        logger.warning(f"Cannot re-enter {symbol}: allocation too small")
+                        continue
+                    
+                    result = self.alpaca.place_market_order(symbol, qty, "buy")
+                    
+                    self.positions[symbol] = {
+                        'symbol': symbol,
+                        'qty': qty,
+                        'avg_entry_price': current_price,
+                        'current_price': current_price,
+                        'market_value': qty * current_price,
+                        'cost_basis': qty * current_price,
+                        'unrealized_pl': 0,
+                        'trailing_active': False,
+                        'peak_price': current_price
+                    }
+                    
+                    self.email.send_reentry_notification(symbol, qty, current_price, qty * current_price, entry_price)
+                    self.journal.log_reentry(symbol, qty, current_price)
+                    
+                    del self.stopped_positions[symbol]
+                    
+                    logger.info(f"Re-entered {symbol}: {qty} shares at ${current_price} (was exited at ${entry_price})")
+            
+            except Exception as e:
+                logger.error(f"Error checking re-entry for {symbol}: {e}")
                 continue
     
     def run(self):
@@ -575,6 +731,10 @@ class TradingBot:
         
         while True:
             try:
+                if self.is_market_open():
+                    if REENTRY_ENABLED:
+                        self.check_reentry()
+                
                 if self.should_rotate():
                     logger.info("Market open - rotating positions")
                     self.rotate_positions()
@@ -605,6 +765,9 @@ def main():
     print(f"  Take Profit: {TAKE_PROFIT_PCT*100:.1f}%")
     print(f"  Stop Loss: {STOP_LOSS_PCT*100:.1f}%")
     print(f"  Trailing Stop: {TRAIL_STOP_PCT*100:.1f}%")
+    print(f"  Re-Entry on Recovery: {REENTRY_ENABLED}")
+    if REENTRY_ENABLED:
+        print(f"  Re-Entry Buffer: {REENTRY_BUFFER_PCT*100:.1f}%")
     print(f"  Check Interval: {CHECK_INTERVAL_SECONDS/60:.0f} minutes")
     print(f"  Market Hours: {MARKET_OPEN_HOUR}:{MARKET_OPEN_MINUTE:02d} - {MARKET_CLOSE_HOUR}:{MARKET_CLOSE_MINUTE:02d} ET")
     print(f"  Dry Run Mode: {DRY_RUN_MODE}")

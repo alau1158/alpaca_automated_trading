@@ -19,12 +19,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from swing_trading_analyzer import MarketScanner, StockAnalyzer
-
-EMAIL = "65gkts3cow@pomail.net, alau1158@gmail.com"
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+from config import EMAIL_RECIPIENTS, SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
 
 
 def send_email_notification(report_content, subject="Daily Market Scan Report"):
@@ -36,7 +31,7 @@ def send_email_notification(report_content, subject="Daily Market Scan Report"):
     try:
         msg = MIMEMultipart()
         msg["From"] = SMTP_USER
-        msg["To"] = EMAIL
+        msg["To"] = ", ".join(EMAIL_RECIPIENTS)
         msg["Subject"] = subject
         
         msg.attach(MIMEText(report_content, "plain"))
@@ -44,10 +39,9 @@ def send_email_notification(report_content, subject="Daily Market Scan Report"):
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
-            recipient_list = [addr.strip() for addr in EMAIL.split(",")]
-            server.sendmail(SMTP_USER, recipient_list, msg.as_string())
+            server.sendmail(SMTP_USER, EMAIL_RECIPIENTS, msg.as_string())
         
-        print(f"Email sent to {EMAIL}")
+        print(f"Email sent to {EMAIL_RECIPIENTS}")
         return True
     except Exception as e:
         print(f"Failed to send email: {e}")
