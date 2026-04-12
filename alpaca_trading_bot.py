@@ -800,6 +800,75 @@ class TradingBot:
                 logger.error(f"Error checking re-entry for {symbol}: {e}")
                 continue
     
+    def rebalance_positions(self):
+        if not self.is_market_open():
+            return
+        
+        if len(self.positions) >= TOP_N_STOCKS:
+            return
+        
+        needed = TOP_N_STOCKS - len(self.positions)
+        logger.info(f"Rebalancing: need {needed} more stock(s) to reach {TOP_N_STOCKS}")
+        
+        buying_power, portfolio_value = self.get_account_info()
+        if not buying_power or buying_power <= 0:
+            logger.warning("No buying power for rebalancing")
+            return
+        
+        top_stocks = self.scanner.get_top_buy_stocks(top_n=needed + len(self.positions))
+        
+        available_symbols = [s['symbol'] for s in top_stocks if s['symbol'] not in self.positions]
+        
+        symbols_to_buy = available_symbols[:needed]
+        
+        if not symbols_to_buy:
+            logger.warning("No new stocks available for rebalancing")
+            return
+        
+        for symbol in symbols_to_buy:
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                
+                if not info or not info.get('regularMarketPrice'):
+                    continue
+                
+                current_price = info['regularMarketPrice']
+                
+                qty = int(buying_power / current_price)
+                
+                if qty <= 0:
+                    logger.warning(f"Cannot buy {symbol}: insufficient funds (${buying_power:.2f}, price: ${current_price:.2f})")
+                    continue
+                
+                result = self.alpaca.place_market_order(symbol, qty, "buy")
+                
+                self.positions[symbol] = {
+                    'symbol': symbol,
+                    'qty': qty,
+                    'avg_entry_price': current_price,
+                    'current_price': current_price,
+                    'market_value': qty * current_price,
+                    'cost_basis': qty * current_price,
+                    'unrealized_pl': 0,
+                    'trailing_active': False,
+                    'peak_price': current_price
+                }
+                
+                self.email.send_buy_notification(symbol, qty, current_price, qty * current_price)
+                self.journal.log_buy(symbol, qty, current_price)
+                
+                logger.info(f"Rebalanced: Opened {symbol} - {qty} shares at ${current_price}")
+                
+                buying_power -= qty * current_price
+                
+                if len(self.positions) >= TOP_N_STOCKS:
+                    break
+            
+            except Exception as e:
+                logger.error(f"Error rebalancing {symbol}: {e}")
+                continue
+    
     def run(self):
         logger.info("Starting trading bot...")
         logger.info(f"Dry run mode: {DRY_RUN_MODE}")
@@ -816,6 +885,7 @@ class TradingBot:
                 
                 if self.is_market_open():
                     self.monitor_positions()
+                    self.rebalance_positions()
                 else:
                     logger.info("Market closed - waiting")
                 
