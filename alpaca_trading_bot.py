@@ -427,6 +427,29 @@ class TradingBot:
         self.positions = {}
         self.stopped_positions = {}  # Track exited positions for re-entry
         self.last_rotation_date = None
+        self.daily_trades = {}  # Track trades per symbol per day for PDT protection
+    
+    PDT_THRESHOLD = 25000
+    
+    def check_pdt_protection(self):
+        buying_power, portfolio_value = self.get_account_info()
+        
+        if portfolio_value and portfolio_value >= self.PDT_THRESHOLD:
+            return True, "Account value sufficient for day trading"
+        
+        return False, f"Account value ${portfolio_value:.2f} below $25,000 PDT threshold"
+    
+    def record_day_trade(self, symbol):
+        today = datetime.now().date()
+        if symbol not in self.daily_trades:
+            self.daily_trades[symbol] = {}
+        if today not in self.daily_trades[symbol]:
+            self.daily_trades[symbol][today] = 0
+        self.daily_trades[symbol][today] += 1
+    
+    def get_day_trade_count(self, symbol):
+        today = datetime.now().date()
+        return self.daily_trades.get(symbol, {}).get(today, 0)
     
     def is_market_open(self):
         from datetime import time as dt_time
@@ -500,6 +523,12 @@ class TradingBot:
     def close_all_positions(self):
         logger.info("Closing all positions...")
         
+        pdt_safe, pdt_msg = self.check_pdt_protection()
+        
+        if not pdt_safe:
+            logger.warning(f"PDT Protection: {pdt_msg} - skipping close to avoid day trade")
+            return
+        
         for symbol in list(self.positions.keys()):
             pos = self.positions[symbol]
             
@@ -522,17 +551,30 @@ class TradingBot:
     def open_positions(self, symbols):
         logger.info(f"Opening positions in: {symbols}")
         
+        self.load_positions()
+        
+        existing_symbols = set(self.positions.keys())
+        symbols_to_buy = [s for s in symbols if s not in existing_symbols]
+        
+        if len(symbols_to_buy) < len(symbols):
+            skipped = set(symbols) - set(symbols_to_buy)
+            logger.info(f"Skipping already-owned stocks: {skipped}")
+        
+        if not symbols_to_buy:
+            logger.info("All target stocks already owned - no new positions to open")
+            return
+        
         buying_power, portfolio_value = self.get_account_info()
         
         if not buying_power or buying_power <= 0:
             logger.warning("No buying power available")
             return
         
-        allocation = (buying_power * ALLOCATION_PERCENT)
+        remaining_allocation = buying_power * ALLOCATION_PERCENT
         
         stock_data = []
         
-        for symbol in symbols:
+        for symbol in symbols_to_buy:
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
@@ -552,6 +594,9 @@ class TradingBot:
         for stock in stock_data:
             symbol = stock['symbol']
             price = stock['price']
+            
+            num_positions = len(stock_data) if stock_data else 1
+            allocation = remaining_allocation / num_positions
             
             qty = int(allocation / price)
             
@@ -628,31 +673,39 @@ class TradingBot:
                 )
                 
                 if should_exit:
-                    logger.info(f"Exiting {symbol}: {reason}")
+                    pdt_safe, pdt_msg = self.check_pdt_protection()
                     
-                    result = self.alpaca.close_position(symbol)
-                    
-                    entry_price = pos['avg_entry_price']
-                    exit_price = current_price
-                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                    
-                    self.email.send_sell_notification(
-                        symbol, pos['qty'], entry_price, exit_price, pnl_pct, reason
-                    )
-                    self.journal.log_sell(symbol, exit_price)
-                    
-                    if REENTRY_ENABLED:
-                        self.stopped_positions[symbol] = {
-                            'entry_price': entry_price,
-                            'exit_price': exit_price,
-                            'exit_time': datetime.now(),
-                            'stop_reason': reason
-                        }
-                        logger.info(f"Tracking {symbol} for re-entry at ${entry_price}")
-                    
-                    del self.positions[symbol]
-                    
-                    logger.info(f"Closed {symbol}: {reason} at ${exit_price}, P&L = {pnl_pct:.2f}%")
+                    if not pdt_safe:
+                        logger.warning(f"PDT Protection: {pdt_msg} - skipping exit for {symbol}")
+                        should_exit = False
+                    else:
+                        logger.info(f"Exiting {symbol}: {reason}")
+                        
+                        result = self.alpaca.close_position(symbol)
+                        
+                        self.record_day_trade(symbol)
+                        
+                        entry_price = pos['avg_entry_price']
+                        exit_price = current_price
+                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                        
+                        self.email.send_sell_notification(
+                            symbol, pos['qty'], entry_price, exit_price, pnl_pct, reason
+                        )
+                        self.journal.log_sell(symbol, exit_price)
+                        
+                        if REENTRY_ENABLED:
+                            self.stopped_positions[symbol] = {
+                                'entry_price': entry_price,
+                                'exit_price': exit_price,
+                                'exit_time': datetime.now(),
+                                'stop_reason': reason
+                            }
+                            logger.info(f"Tracking {symbol} for re-entry at ${entry_price}")
+                        
+                        del self.positions[symbol]
+                        
+                        logger.info(f"Closed {symbol}: {reason} at ${exit_price}, P&L = {pnl_pct:.2f}%")
             
             except Exception as e:
                 logger.error(f"Error monitoring {symbol}: {e}")
@@ -771,6 +824,7 @@ def main():
     print(f"  Check Interval: {CHECK_INTERVAL_SECONDS/60:.0f} minutes")
     print(f"  Market Hours: {MARKET_OPEN_HOUR}:{MARKET_OPEN_MINUTE:02d} - {MARKET_CLOSE_HOUR}:{MARKET_CLOSE_MINUTE:02d} ET")
     print(f"  Dry Run Mode: {DRY_RUN_MODE}")
+    print(f"  PDT Protection: $25,000 threshold")
     
     if DRY_RUN_MODE:
         print("\n*** DRY RUN MODE ENABLED - NO REAL TRADES ***")
