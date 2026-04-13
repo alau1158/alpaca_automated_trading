@@ -260,6 +260,9 @@ class AlpacaClient:
     def get_account(self):
         return self._request("GET", "/account")
     
+    def get_clock(self):
+        return self._request("GET", "/clock")
+    
     def get_positions(self):
         return self._request("GET", "/positions") or []
     
@@ -507,14 +510,26 @@ class TradingBot:
         today = datetime.now().date()
         return self.daily_trades.get(symbol, {}).get(today, 0)
     
+    def get_clock(self):
+        return self._request("GET", "/clock")
+    
     def is_market_open(self):
         from datetime import time as dt_time
         from config import RUN_TEST_MODE
+        import pytz
         
         if RUN_TEST_MODE:
-            return True  # Bypass market hours for testing
+            return True
         
-        now = datetime.now()
+        try:
+            clock = self.alpaca.get_clock()
+            if clock and clock.get("is_open") is not None:
+                return clock["is_open"]
+        except:
+            pass
+        
+        ny_tz = pytz.timezone(MARKET_TZ)
+        now = datetime.now(ny_tz)
         current_time = now.time()
         
         open_time = dt_time(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE)
@@ -527,11 +542,13 @@ class TradingBot:
     
     def should_rotate(self):
         from config import RUN_TEST_MODE
+        import pytz
         
         if RUN_TEST_MODE:
-            return True  # Allow rotation anytime in test mode
+            return True
         
-        today = datetime.now().date()
+        ny_tz = pytz.timezone(MARKET_TZ)
+        today = datetime.now(ny_tz).date()
         
         if self.last_rotation_date != today:
             if self.is_market_open():
