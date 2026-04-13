@@ -38,6 +38,11 @@ MARKET_CLOSE_MINUTE = 0
 DRY_RUN_MODE = False
 RUN_TEST_MODE = False
 
+# News Filter Settings
+ENABLE_NEWS_FILTER = True
+NEWS_DAYS_LOOKBACK = 7
+NEWS_LIMIT_PER_STOCK = 10
+
 LOG_FILE = "alpaca_trading.log"
 
 MARKET_TZ = "America/New_York"

@@ -36,8 +36,8 @@ class GeminiAnalyzer:
         genai.configure(api_key=self.api_key)
         # Model names for google-generativeai SDK
         self.model_names = [
-            'gemini-3.1-pro-preview',
-            'gemini-3-flash-preview'
+            'gemini-3-flash-preview',
+            'gemini-3.1-pro-preview'
       #      'gemini-2.5-flash',
       #      'gemini-2.5-flash-latest',
       #      'gemini-1.5-flash-latest',
@@ -328,6 +328,47 @@ Be specific with dollar amounts and percentages. Give clear YES/NO on whether yo
                 'strategy': None,
                 'success': False,
                 'error': str(e)
+            }
+    
+    def analyze_news(self, symbol: str, news_text: str) -> Dict:
+        """
+        Analyze news sentiment and identify key events (earnings, etc.)
+        """
+        try:
+            prompt = f"""Analyze the following recent news for {symbol} and determine if it's safe to open a new swing trading position.
+            
+Recent News:
+{news_text}
+
+Provide:
+1. SENTIMENT: Overall sentiment (Positive/Negative/Neutral)
+2. KEY EVENTS: Identify any upcoming earnings reports, major product launches, or geopolitical events mentioned.
+3. RISK LEVEL: High/Medium/Low based on the news.
+4. RECOMMENDATION: Should we PROCEED or AVOID this trade based ONLY on the news?
+5. RATIONALE: Brief explanation of why.
+
+Be conservative. If there's an earnings report in the next 3 days, it's usually an AVOID for swing trading unless specifically mentioned as a positive catalyst with low risk."""
+
+            response = self.model.generate_content(prompt)
+            
+            # Simple parsing of recommendation
+            proceed = "PROCEED" in response.text.upper() and "AVOID" not in response.text.upper()
+            if not proceed and "AVOID" not in response.text.upper():
+                # If neither is clear, default to AVOID if sentiment is negative
+                proceed = "NEGATIVE" not in response.text.upper()
+
+            return {
+                'symbol': symbol,
+                'analysis': response.text,
+                'proceed': proceed,
+                'success': True
+            }
+        except Exception as e:
+            return {
+                'symbol': symbol,
+                'analysis': f"Error analyzing news: {e}",
+                'proceed': True, # Default to True to not block if AI fails? Or False to be safe? 
+                'success': False
             }
 
 

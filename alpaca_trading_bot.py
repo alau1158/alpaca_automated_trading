@@ -36,9 +36,12 @@ from config import (
     REENTRY_ENABLED, REENTRY_BUFFER_PCT,
     CHECK_INTERVAL_SECONDS,
     MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
-    DRY_RUN_MODE, LOG_FILE, MARKET_TZ
+    DRY_RUN_MODE, LOG_FILE, MARKET_TZ,
+    ENABLE_NEWS_FILTER, NEWS_DAYS_LOOKBACK, NEWS_LIMIT_PER_STOCK
 )
 from swing_trading_analyzer import MarketScanner, StockAnalyzer, TechnicalAnalyzer
+from news_fetcher import NewsFetcher
+from gemini_analyzer import GeminiAnalyzer
 
 
 logging.basicConfig(
@@ -312,6 +315,12 @@ class AlpacaClient:
 class MarketScanReader:
     def __init__(self):
         self.ta = TechnicalAnalyzer()
+        self.news_fetcher = NewsFetcher() if ENABLE_NEWS_FILTER else None
+        try:
+            self.gemini = GeminiAnalyzer() if ENABLE_NEWS_FILTER else None
+        except Exception as e:
+            logger.warning(f"Gemini AI not available for news filtering: {e}")
+            self.gemini = None
     
     def run_scan(self, top_n=15):
         logger.info(f"Running market scan for top {top_n} stocks...")
@@ -327,6 +336,31 @@ class MarketScanReader:
         
         return results
     
+    def check_news_safety(self, symbol):
+        """Check if news is safe for trading this symbol"""
+        if not ENABLE_NEWS_FILTER or not self.news_fetcher or not self.gemini:
+            return True
+        
+        logger.info(f"Checking news for {symbol}...")
+        news = self.news_fetcher.get_stock_news(
+            symbol, days=NEWS_DAYS_LOOKBACK, limit=NEWS_LIMIT_PER_STOCK
+        )
+        
+        if not news:
+            logger.info(f"News Filter: No recent news for {symbol}, proceeding.")
+            return True
+            
+        formatted_news = self.news_fetcher.format_news_for_ai(news)
+        analysis = self.gemini.analyze_news(symbol, formatted_news)
+        
+        if not analysis.get('proceed', True):
+            logger.info(f"News Filter: Skipping {symbol} due to negative news or upcoming events.")
+            logger.info(f"News Analysis Summary: {analysis.get('analysis').splitlines()[0]}...") # Log first line
+            return False
+            
+        logger.info(f"News Filter: {symbol} passed.")
+        return True
+
     def get_top_buy_stocks(self, top_n=3):
         results = self.run_scan(top_n=TOP_N_STOCKS * 5)
         
@@ -351,6 +385,10 @@ class MarketScanReader:
                 
                 if info.get('regularMarketPrice') and info.get('regularMarketPrice') > 1:
                     current_price = info.get('regularMarketPrice')
+                    
+                    # News Filter
+                    if not self.check_news_safety(symbol):
+                        continue
                     
                     candidates.append({
                         'symbol': symbol,
@@ -768,6 +806,14 @@ class TradingBot:
                 reentry_threshold = entry_price * (1 + REENTRY_BUFFER_PCT)
                 
                 if current_price >= reentry_threshold:
+                    # Check news safety before re-entry
+                    if not self.scanner.check_news_safety(symbol):
+                        logger.info(f"Re-entry blocked for {symbol} due to news safety filter.")
+                        # Optionally remove from stopped_positions so we don't keep checking?
+                        # Or keep it and wait for better news? 
+                        # Let's keep it for now, but maybe the user wants it removed if news is bad.
+                        continue
+
                     allocation = cash * ALLOCATION_PERCENT
                     qty = int(allocation / current_price)
                     
@@ -835,6 +881,10 @@ class TradingBot:
                 
                 current_price = info['regularMarketPrice']
                 
+                # Check news safety before rebalancing buy
+                if not self.scanner.check_news_safety(symbol):
+                    continue
+
                 qty = int(cash / current_price)
                 
                 if qty <= 0:
@@ -913,6 +963,7 @@ def main():
     print(f"  Re-Entry on Recovery: {REENTRY_ENABLED}")
     if REENTRY_ENABLED:
         print(f"  Re-Entry Buffer: {REENTRY_BUFFER_PCT*100:.1f}%")
+    print(f"  News Filter: {ENABLE_NEWS_FILTER} ({NEWS_DAYS_LOOKBACK} days lookback)")
     print(f"  Check Interval: {CHECK_INTERVAL_SECONDS/60:.0f} minutes")
     print(f"  Market Hours: {MARKET_OPEN_HOUR}:{MARKET_OPEN_MINUTE:02d} - {MARKET_CLOSE_HOUR}:{MARKET_CLOSE_MINUTE:02d} ET")
     print(f"  Dry Run Mode: {DRY_RUN_MODE}")
