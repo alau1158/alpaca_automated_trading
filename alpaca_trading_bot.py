@@ -34,6 +34,7 @@ from config import (
     TOP_N_STOCKS, ALLOCATION_PERCENT,
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAIL_STOP_PCT, TRAIL_ACTIVATION_PCT,
     REENTRY_ENABLED, REENTRY_BUFFER_PCT,
+    MAX_HOLDING_DAYS, EARNINGS_LOOKAHEAD_DAYS,
     CHECK_INTERVAL_SECONDS,
     MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
     DRY_RUN_MODE, LOG_FILE, MARKET_TZ,
@@ -363,6 +364,39 @@ class MarketScanReader:
             
         logger.info(f"News Filter: {symbol} passed.")
         return True
+    
+    def check_earnings_safe(self, symbol):
+        """Check if earnings date is too close (within 2 weeks)"""
+        import io
+        import sys
+        from datetime import datetime, timezone
+        
+        try:
+            old_stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            
+            ticker = yf.Ticker(symbol)
+            earnings = ticker.earnings_dates
+            
+            sys.stderr = old_stderr
+            
+            if earnings is None or len(earnings) == 0:
+                return True
+            
+            now = datetime.now(timezone.utc)
+            
+            for date in earnings.index:
+                days_until = (date.replace(tzinfo=timezone.utc) - now).days
+                
+                if 0 <= days_until <= EARNINGS_LOOKAHEAD_DAYS:
+                    logger.info(f"Earnings Filter: Skipping {symbol} - earnings in {days_until} days")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            sys.stderr = old_stderr
+            return True
 
     def get_top_buy_stocks(self, top_n=3):
         results = self.run_scan(top_n=TOP_N_STOCKS * 5)
@@ -391,6 +425,10 @@ class MarketScanReader:
                     
                     # News Filter
                     if not self.check_news_safety(symbol):
+                        continue
+                    
+                    # Earnings Filter - skip if earnings within 2 weeks
+                    if not self.check_earnings_safe(symbol):
                         continue
                     
                     candidates.append({
@@ -455,6 +493,23 @@ class TradingStrategy:
             trail_price = peak_price * (1 - self.trail_stop_pct)
             if current_price <= trail_price:
                 return True, f"Trailing Stop (Profit: {pnl_pct*100:.2f}%)"
+        
+        # Time-based exit (max holding period)
+        entry_time = current_position.get('entry_time')
+        if entry_time:
+            try:
+                if isinstance(entry_time, str):
+                    entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                else:
+                    entry_dt = entry_time
+                
+                now = datetime.now(timezone.utc)
+                holding_days = (now - entry_dt).days
+                
+                if holding_days >= MAX_HOLDING_DAYS:
+                    return True, f"Max Hold Time ({holding_days} days)"
+            except Exception:
+                pass
         
         # If we hit take profit but trailing isn't active yet, 
         # normally we'd exit, but user wants trailing past 5%.
@@ -590,7 +645,8 @@ class TradingBot:
                 'cost_basis': float(pos.get('cost_basis', 0)),
                 'unrealized_pl': float(pos.get('unrealized_pl', 0)),
                 'trailing_active': False,
-                'peak_price': float(pos.get('current_price', 0))
+                'peak_price': float(pos.get('current_price', 0)),
+                'entry_time': pos.get('opened_at')
             }
     
     def close_all_positions(self):
@@ -686,7 +742,8 @@ class TradingBot:
                 'cost_basis': qty * price,
                 'unrealized_pl': 0,
                 'trailing_active': False,
-                'peak_price': price
+                'peak_price': price,
+                'entry_time': datetime.now(timezone.utc).isoformat()
             }
             
             self.email.send_buy_notification(symbol, qty, price, qty * price)
