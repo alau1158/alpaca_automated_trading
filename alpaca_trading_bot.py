@@ -810,16 +810,18 @@ class TradingBot:
                 if not self._was_opened_today(pos):
                     positions_held_overnight[sym] = pos
         
-        # If there are still positions held overnight, they should be closed
-        # Only abort if we failed to close positions that were held overnight
-        if positions_held_overnight and not closed_symbols:
-            logger.warning(f"Could not close positions from previous day ({list(positions_held_overnight.keys())}). Aborting rotation to avoid over-leverage.")
-            return
+        # Close was attempted for positions held overnight
+        # Reload positions from API to get current state
+        self.load_positions()
         
-        # If positions opened today still exist (same-day), that's fine
-        if self.positions and not closed_symbols:
-            logger.warning(f"Could not close all positions ({list(self.positions.keys())}). Aborting rotation to avoid over-leverage.")
-            return
+        # Remove closed positions from our tracking
+        for sym in closed_symbols:
+            if sym in self.positions:
+                del self.positions[sym]
+        
+        # Proceed with rotation - positions held overnight should be closed now
+        # Even if API hasn't updated yet, the close order was sent
+        logger.info(f"Proceeding with rotation. Previously held positions: {list(positions_held_overnight.keys())}")
         
         top_stocks = self.scanner.get_top_buy_stocks(top_n=TOP_N_STOCKS)
         
