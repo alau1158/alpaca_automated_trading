@@ -224,6 +224,23 @@ class JournalLogger:
     
     def log_reentry(self, symbol, quantity, price):
         self.log_buy(symbol, quantity, price)
+    
+    def get_bought_date(self, symbol):
+        try:
+            with open(self.journal_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            
+            for row in rows:
+                row = {k.strip(): v for k, v in row.items()}
+                if row.get("ticket", "").upper() == symbol.upper() and not row.get("sold_date", "").strip():
+                    bought_date_str = row.get("bought_date", "").strip()
+                    if bought_date_str:
+                        return datetime.strptime(bought_date_str, "%Y%m%d")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get bought date from journal: {e}")
+            return None
 
 
 def pnl_direction(pnl):
@@ -480,7 +497,7 @@ class TradingStrategy:
             'stop_loss': stop_loss
         }
     
-    def should_exit(self, current_price, entry_price, peak_price, current_position):
+    def should_exit(self, symbol, current_price, entry_price, peak_price, current_position, journal):
         entry = entry_price
         pnl_pct = (current_price - entry) / entry
         
@@ -494,22 +511,14 @@ class TradingStrategy:
             if current_price <= trail_price:
                 return True, f"Trailing Stop (Profit: {pnl_pct*100:.2f}%)"
         
-        # Time-based exit (max holding period)
-        entry_time = current_position.get('entry_time')
-        if entry_time:
-            try:
-                if isinstance(entry_time, str):
-                    entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
-                else:
-                    entry_dt = entry_time
-                
-                now = datetime.now(timezone.utc)
-                holding_days = (now - entry_dt).days
-                
-                if holding_days >= MAX_HOLDING_DAYS:
-                    return True, f"Max Hold Time ({holding_days} days)"
-            except Exception:
-                pass
+        # Time-based exit (max holding period) - use journal.csv for accurate holding days
+        bought_dt = journal.get_bought_date(symbol)
+        if bought_dt:
+            now = datetime.now(timezone.utc)
+            holding_days = (now - bought_dt).days
+            
+            if holding_days >= MAX_HOLDING_DAYS:
+                return True, f"Max Hold Time ({holding_days} days)"
         
         # If we hit take profit but trailing isn't active yet, 
         # normally we'd exit, but user wants trailing past 5%.
@@ -803,7 +812,7 @@ class TradingBot:
                 )
                 
                 should_exit, reason = self.strategy.should_exit(
-                    current_price, pos['avg_entry_price'], pos['peak_price'], pos
+                    symbol, current_price, pos['avg_entry_price'], pos['peak_price'], pos, self.journal
                 )
                 
                 if should_exit:
