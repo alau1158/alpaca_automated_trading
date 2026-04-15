@@ -1079,6 +1079,10 @@ class TradingBot:
                 
                 result = self.alpaca.place_market_order(symbol, qty, "buy")
                 
+                if result is None:
+                    logger.error(f"Failed to place order for {symbol}")
+                    continue
+                
                 self.positions[symbol] = {
                     'symbol': symbol,
                     'qty': qty,
