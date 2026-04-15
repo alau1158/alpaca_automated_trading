@@ -673,6 +673,8 @@ class TradingBot:
             
             entry_time = pos.get('entry_time')
             entry_date = None
+            is_opened_today = False
+            
             if entry_time:
                 try:
                     if isinstance(entry_time, str):
@@ -684,16 +686,20 @@ class TradingBot:
                         entry_date = entry_time.date()
                     
                     today = datetime.now(timezone.utc).date()
-                    logger.info(f"Position {symbol}: entry_date={entry_date}, today={today}, held_overnight={entry_date < today}")
+                    is_opened_today = (entry_date == today)
+                    logger.info(f"Position {symbol}: entry_date={entry_date}, today={today}, held_overnight={not is_opened_today}")
                     
-                    if entry_date == today:
+                    if is_opened_today:
                         logger.warning(f"Position {symbol} opened today ({entry_date}) - skipping close to avoid day trade")
                         failed_symbols.append(symbol)
                         continue
                 except Exception as e:
                     logger.debug(f"Could not parse entry_time for {symbol}: {e}")
+            else:
+                # No entry_time - assume it's an old position (should have been opened before today)
+                logger.info(f"Position {symbol}: no entry_time, assuming held overnight - allowing close")
             
-            logger.info(f"Closing position {symbol} (held overnight: {entry_date is not None and entry_date < datetime.now(timezone.utc).date()})")
+            logger.info(f"Closing position {symbol} (held overnight: {entry_date is None or (entry_date is not None and entry_date < datetime.now(timezone.utc).date())})")
             result = self.alpaca.close_position(symbol)
             
             entry_price = pos['avg_entry_price']
