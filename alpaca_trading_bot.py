@@ -514,8 +514,10 @@ class TradingStrategy:
         # Time-based exit (max holding period) - use journal.csv for accurate holding days
         bought_dt = journal.get_bought_date(symbol)
         if bought_dt:
-            now = datetime.now(timezone.utc)
-            holding_days = (now - bought_dt).days
+            now = datetime.now()
+            if bought_dt.tzinfo is not None:
+                now = datetime.now(timezone.utc)
+            holding_days = (now - bought_dt.replace(tzinfo=None)).days
             
             if holding_days >= MAX_HOLDING_DAYS:
                 return True, f"Max Hold Time ({holding_days} days)"
@@ -789,19 +791,20 @@ class TradingBot:
         # Reload positions to see what actually closed
         self.load_positions()
         
-        # Only abort if there are positions that should have been closed but didn't
-        # (i.e., they were held >1 day but failed to close for some other reason)
-        still_open_from_previous_day = [
-            sym for sym in failed_symbols 
-            if self.positions.get(sym) and self._was_held_more_than_one_day(self.positions.get(sym))
-        ]
+        # Get positions that were held more than one day
+        positions_held_overnight = {
+            sym: pos for sym, pos in self.positions.items() 
+            if not self._was_opened_today(pos)
+        }
         
-        if still_open_from_previous_day:
-            logger.warning(f"Could not close positions from previous day ({still_open_from_previous_day}). Aborting rotation to avoid over-leverage.")
+        # If there are still positions held overnight, abort rotation
+        if positions_held_overnight:
+            logger.warning(f"Could not close positions from previous day ({list(positions_held_overnight.keys())}). Aborting rotation to avoid over-leverage.")
             return
         
-        # Only proceed if we've closed all old positions (or they weren't held overnight)
-        if self.positions and not failed_symbols:
+        # If positions opened today still exist, that's fine - they are not day trades
+        # We can proceed to rotate if old positions are closed
+        if self.positions and not closed_symbols:
             logger.warning(f"Could not close all positions ({list(self.positions.keys())}). Aborting rotation to avoid over-leverage.")
             return
         
@@ -814,6 +817,28 @@ class TradingBot:
         self.last_rotation_date = datetime.now().date()
         
         logger.info(f"Rotation complete. New positions: {symbols}")
+    
+    def _was_opened_today(self, pos):
+        """Check if position was opened today"""
+        if not pos:
+            return False
+        entry_time = pos.get('entry_time')
+        if not entry_time:
+            return False
+        
+        try:
+            if isinstance(entry_time, str):
+                if 'T' in entry_time:
+                    entry_date = datetime.fromisoformat(entry_time.replace('Z', '+00:00')).date()
+                else:
+                    entry_date = datetime.strptime(entry_time, "%Y-%m-%d").date()
+            else:
+                entry_date = entry_time.date()
+            
+            today = datetime.now(timezone.utc).date()
+            return entry_date == today
+        except:
+            return False
     
     def _was_held_more_than_one_day(self, pos):
         """Check if position was opened more than 1 trading day ago"""
@@ -872,12 +897,13 @@ class TradingBot:
                 )
                 
                 if should_exit:
+                    # Allow exit if position held >1 day (not a day trade)
+                    # Only block same-day exits for accounts under PDT threshold
                     pdt_safe, pdt_msg = self.check_pdt_protection()
+                    is_opened_today = self._was_opened_today(pos)
                     
-                    if not pdt_safe:
-                        logger.warning(f"PDT Protection: {pdt_msg} - skipping exit for {symbol}")
-                        should_exit = False
-                    else:
+                    # Allow exit if: position held overnight OR account has sufficient funds
+                    if not is_opened_today or pdt_safe:
                         logger.info(f"Exiting {symbol}: {reason}")
                         
                         result = self.alpaca.close_position(symbol)
