@@ -672,6 +672,7 @@ class TradingBot:
                 continue
             
             entry_time = pos.get('entry_time')
+            entry_date = None
             if entry_time:
                 try:
                     if isinstance(entry_time, str):
@@ -683,6 +684,8 @@ class TradingBot:
                         entry_date = entry_time.date()
                     
                     today = datetime.now(timezone.utc).date()
+                    logger.info(f"Position {symbol}: entry_date={entry_date}, today={today}, held_overnight={entry_date < today}")
+                    
                     if entry_date == today:
                         logger.warning(f"Position {symbol} opened today ({entry_date}) - skipping close to avoid day trade")
                         failed_symbols.append(symbol)
@@ -690,6 +693,7 @@ class TradingBot:
                 except Exception as e:
                     logger.debug(f"Could not parse entry_time for {symbol}: {e}")
             
+            logger.info(f"Closing position {symbol} (held overnight: {entry_date is not None and entry_date < datetime.now(timezone.utc).date()})")
             result = self.alpaca.close_position(symbol)
             
             entry_price = pos['avg_entry_price']
@@ -792,18 +796,27 @@ class TradingBot:
         self.load_positions()
         
         # Get positions that were held more than one day
-        positions_held_overnight = {
-            sym: pos for sym, pos in self.positions.items() 
-            if not self._was_opened_today(pos)
-        }
+        # Use journal.csv to determine holding period since API may have issues
+        positions_held_overnight = {}
+        for sym, pos in self.positions.items():
+            bought_dt = self.journal.get_bought_date(sym)
+            if bought_dt:
+                bought_date = bought_dt.date() if hasattr(bought_dt, 'date') else bought_dt
+                held_days = (datetime.now().date() - bought_date).days
+                if held_days >= 1:
+                    positions_held_overnight[sym] = pos
+            else:
+                # No journal entry, check API entry_time
+                if not self._was_opened_today(pos):
+                    positions_held_overnight[sym] = pos
         
-        # If there are still positions held overnight, abort rotation
-        if positions_held_overnight:
+        # If there are still positions held overnight, they should be closed
+        # Only abort if we failed to close positions that were held overnight
+        if positions_held_overnight and not closed_symbols:
             logger.warning(f"Could not close positions from previous day ({list(positions_held_overnight.keys())}). Aborting rotation to avoid over-leverage.")
             return
         
-        # If positions opened today still exist, that's fine - they are not day trades
-        # We can proceed to rotate if old positions are closed
+        # If positions opened today still exist (same-day), that's fine
         if self.positions and not closed_symbols:
             logger.warning(f"Could not close all positions ({list(self.positions.keys())}). Aborting rotation to avoid over-leverage.")
             return
