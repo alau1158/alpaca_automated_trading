@@ -559,7 +559,7 @@ class TradingBot:
         if portfolio_value is not None and portfolio_value >= self.PDT_THRESHOLD:
             return True, "Account value sufficient for day trading"
         
-        val_str = f"${portfolio_value:.2f}" if portfolio_value is not None else "Unknown"
+        val_str = f"${portfolio_value:.2f}" if portfolio_value is not None else "Unknown (check API)"
         return False, f"Account value {val_str} below $25,000 PDT threshold"
     
     def record_day_trade(self, symbol):
@@ -661,14 +661,32 @@ class TradingBot:
     def close_all_positions(self):
         logger.info("Closing all positions...")
         
-        pdt_safe, pdt_msg = self.check_pdt_protection()
-        
-        if not pdt_safe:
-            logger.warning(f"PDT Protection: {pdt_msg} - skipping close to avoid day trade")
-            return
+        closed_symbols = []
+        failed_symbols = []
         
         for symbol in list(self.positions.keys()):
-            pos = self.positions[symbol]
+            pos = self.positions.get(symbol)
+            if not pos:
+                continue
+            
+            entry_time = pos.get('entry_time')
+            if entry_time:
+                try:
+                    if isinstance(entry_time, str):
+                        if 'T' in entry_time:
+                            entry_date = datetime.fromisoformat(entry_time.replace('Z', '+00:00')).date()
+                        else:
+                            entry_date = datetime.strptime(entry_time, "%Y-%m-%d").date()
+                    else:
+                        entry_date = entry_time.date()
+                    
+                    today = datetime.now(timezone.utc).date()
+                    if entry_date == today:
+                        logger.warning(f"Position {symbol} opened today ({entry_date}) - skipping close to avoid day trade")
+                        failed_symbols.append(symbol)
+                        continue
+                except Exception as e:
+                    logger.debug(f"Could not parse entry_time for {symbol}: {e}")
             
             result = self.alpaca.close_position(symbol)
             
@@ -682,9 +700,12 @@ class TradingBot:
             self.journal.log_sell(symbol, exit_price)
             
             logger.info(f"Closed {symbol}: P&L = {pnl_pct:.2f}%")
+            closed_symbols.append(symbol)
         
         self.positions = {}
         self.alpaca.cancel_all_orders()
+        
+        return closed_symbols, failed_symbols
     
     def open_positions(self, symbols):
         logger.info(f"Opening positions in: {symbols}")
@@ -763,11 +784,24 @@ class TradingBot:
     def rotate_positions(self):
         logger.info("Running daily position rotation...")
         
-        self.close_all_positions()
+        closed_symbols, failed_symbols = self.close_all_positions()
         
-        # Reload positions to see if they actually closed
+        # Reload positions to see what actually closed
         self.load_positions()
-        if self.positions:
+        
+        # Only abort if there are positions that should have been closed but didn't
+        # (i.e., they were held >1 day but failed to close for some other reason)
+        still_open_from_previous_day = [
+            sym for sym in failed_symbols 
+            if self.positions.get(sym) and self._was_held_more_than_one_day(self.positions.get(sym))
+        ]
+        
+        if still_open_from_previous_day:
+            logger.warning(f"Could not close positions from previous day ({still_open_from_previous_day}). Aborting rotation to avoid over-leverage.")
+            return
+        
+        # Only proceed if we've closed all old positions (or they weren't held overnight)
+        if self.positions and not failed_symbols:
             logger.warning(f"Could not close all positions ({list(self.positions.keys())}). Aborting rotation to avoid over-leverage.")
             return
         
@@ -780,6 +814,28 @@ class TradingBot:
         self.last_rotation_date = datetime.now().date()
         
         logger.info(f"Rotation complete. New positions: {symbols}")
+    
+    def _was_held_more_than_one_day(self, pos):
+        """Check if position was opened more than 1 trading day ago"""
+        if not pos:
+            return False
+        entry_time = pos.get('entry_time')
+        if not entry_time:
+            return True  # Assume old if no timestamp
+        
+        try:
+            if isinstance(entry_time, str):
+                if 'T' in entry_time:
+                    entry_date = datetime.fromisoformat(entry_time.replace('Z', '+00:00')).date()
+                else:
+                    entry_date = datetime.strptime(entry_time, "%Y-%m-%d").date()
+            else:
+                entry_date = entry_time.date()
+            
+            today = datetime.now(timezone.utc).date()
+            return entry_date < today
+        except:
+            return True  # Assume old if can't parse
     
     def monitor_positions(self):
         logger.info("Monitoring positions...")
