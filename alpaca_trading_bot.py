@@ -922,37 +922,37 @@ class TradingBot:
                     # Only block same-day exits for accounts under PDT threshold
                     pdt_safe, pdt_msg = self.check_pdt_protection()
                     is_opened_today = self._was_opened_today(pos)
-                    
+
                     # Allow exit if: position held overnight OR account has sufficient funds
                     if not is_opened_today or pdt_safe:
                         logger.info(f"Exiting {symbol}: {reason}")
-                        
-                        result = self.alpaca.close_position(symbol)
-                        
-                        self.record_day_trade(symbol)
-                        
-                        entry_price = pos['avg_entry_price']
+
                         exit_price = current_price
+                        entry_price = pos['avg_entry_price']
+                        qty = pos['qty']
                         pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                        
-                        self.email.send_sell_notification(
-                            symbol, pos['qty'], entry_price, exit_price, pnl_pct, reason
-                        )
-                        self.journal.log_sell(symbol, exit_price)
-                        
-                        if REENTRY_ENABLED:
-                            self.stopped_positions[symbol] = {
-                                'entry_price': entry_price,
-                                'exit_price': exit_price,
-                                'exit_time': datetime.now(),
-                                'stop_reason': reason
-                            }
-                            logger.info(f"Tracking {symbol} for re-entry at ${entry_price}")
-                        
-                        del self.positions[symbol]
-                        
-                        logger.info(f"Closed {symbol}: {reason} at ${exit_price}, P&L = {pnl_pct:.2f}%")
-            
+
+                        try:
+                            result = self.alpaca.close_position(symbol)
+                            self.record_day_trade(symbol)
+                            self.email.send_sell_notification(
+                                symbol, qty, entry_price, exit_price, pnl_pct, reason
+                            )
+
+                            if REENTRY_ENABLED:
+                                self.stopped_positions[symbol] = {
+                                    'entry_price': entry_price,
+                                    'exit_price': exit_price,
+                                    'exit_time': datetime.now(),
+                                    'stop_reason': reason
+                                }
+                                logger.info(f"Tracking {symbol} for re-entry at ${entry_price}")
+
+                            del self.positions[symbol]
+                            logger.info(f"Closed {symbol}: {reason} at ${exit_price}, P&L = {pnl_pct:.2f}%")
+                        finally:
+                            self.journal.log_sell(symbol, exit_price)
+
             except Exception as e:
                 logger.error(f"Error monitoring {symbol}: {e}")
                 continue
