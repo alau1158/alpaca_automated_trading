@@ -180,11 +180,12 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
 class JournalLogger:
     def __init__(self, journal_path="/home/alau/autotrading/journal.csv"):
         self.journal_path = journal_path
-    
+        self.fields = ["ticket", "quantity", "bought_date", "bought_price", "sold_date", "sold_price", "exit_reason", "atr", "holding_days"]
+
     def _format_date(self, dt):
         return dt.strftime("%Y%m%d")
-    
-    def log_buy(self, symbol, quantity, price):
+
+    def log_buy(self, symbol, quantity, price, atr=None):
         try:
             with open(self.journal_path, "a", newline="") as f:
                 writer = csv.writer(f)
@@ -194,38 +195,43 @@ class JournalLogger:
                     self._format_date(datetime.now()),
                     f"{price:.2f}",
                     "",
+                    "",
+                    "",
+                    f"{atr:.2f}" if atr else "",
                     ""
                 ])
             logger.info(f"Journal: Logged BUY {symbol}")
         except Exception as e:
             logger.error(f"Failed to log buy to journal: {e}")
-    
-    def log_sell(self, symbol, sold_price):
+
+    def log_sell(self, symbol, sold_price, exit_reason="", holding_days=0):
         try:
             with open(self.journal_path, "r", newline="") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-            
+
             for row in rows:
                 row = {k.strip(): v for k, v in row.items()}
                 if row.get("ticket", "").upper() == symbol.upper() and not row.get("sold_date", "").strip():
                     row["sold_date"] = self._format_date(datetime.now())
                     row["sold_price"] = f"{sold_price:.2f}"
-                    
+                    row["exit_reason"] = exit_reason
+                    row["holding_days"] = str(holding_days)
+
                     with open(self.journal_path, "w", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=["ticket", "quanity", "bought_date", "bought_price", "sold_date", "sold_price"])
+                        writer = csv.DictWriter(f, fieldnames=self.fields)
                         writer.writeheader()
                         for r in rows:
                             writer.writerow(r)
                     logger.info(f"Journal: Logged SELL {symbol}")
                     return
-            
+
             logger.warning(f"No open position found for {symbol} in journal")
         except Exception as e:
             logger.error(f"Failed to log sell to journal: {e}")
     
-    def log_reentry(self, symbol, quantity, price):
-        self.log_buy(symbol, quantity, price)
+    def log_reentry(self, symbol, quantity, price, atr=None):
+        self.log_buy(symbol, quantity, price, atr)
     
     def get_bought_date(self, symbol):
         try:
@@ -742,16 +748,23 @@ class TradingBot:
             
             logger.info(f"Closing position {symbol} (held overnight: {entry_date is None or (entry_date is not None and entry_date < datetime.now(timezone.utc).date())})")
             result = self.alpaca.close_position(symbol)
-            
+
             entry_price = pos['avg_entry_price']
             exit_price = pos['current_price']
             pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-            
+            atr = pos.get('atr')
+
+            bought_dt = self.journal.get_bought_date(symbol)
+            if bought_dt:
+                holding_days = (datetime.now() - bought_dt.replace(tzinfo=None)).days
+            else:
+                holding_days = 0
+
             self.email.send_sell_notification(
                 symbol, pos['qty'], entry_price, exit_price, pnl_pct, "Daily Rotation"
             )
-            self.journal.log_sell(symbol, exit_price)
-            
+            self.journal.log_sell(symbol, exit_price, "Daily Rotation", holding_days)
+
             logger.info(f"Closed {symbol}: P&L = {pnl_pct:.2f}%")
             closed_symbols.append(symbol)
         
@@ -835,7 +848,7 @@ class TradingBot:
             }
 
             self.email.send_buy_notification(symbol, qty, price, qty * price)
-            self.journal.log_buy(symbol, qty, price)
+            self.journal.log_buy(symbol, qty, price, atr)
 
             logger.info(f"Opened {symbol}: {qty} shares at ${price}, ATR ${atr:.2f}")
     
@@ -961,6 +974,12 @@ class TradingBot:
                         qty = pos['qty']
                         pnl_pct = ((exit_price - entry_price) / entry_price) * 100
 
+                        bought_dt = self.journal.get_bought_date(symbol)
+                        if bought_dt:
+                            holding_days = (datetime.now() - bought_dt.replace(tzinfo=None)).days
+                        else:
+                            holding_days = 0
+
                         try:
                             result = self.alpaca.close_position(symbol)
                             self.record_day_trade(symbol)
@@ -980,7 +999,7 @@ class TradingBot:
                             del self.positions[symbol]
                             logger.info(f"Closed {symbol}: {reason} at ${exit_price}, P&L = {pnl_pct:.2f}%")
                         finally:
-                            self.journal.log_sell(symbol, exit_price)
+                            self.journal.log_sell(symbol, exit_price, reason, holding_days)
 
             except Exception as e:
                 logger.error(f"Error monitoring {symbol}: {e}")
@@ -989,55 +1008,57 @@ class TradingBot:
     def check_reentry(self):
         if not REENTRY_ENABLED:
             return
-        
+
         if not self.stopped_positions:
             return
-        
+
         if not self.is_market_open():
             return
-        
+
         cash, portfolio_value = self.get_account_info()
-        
+
         if not cash or cash <= 0:
             return
-        
+
         reentry_symbols = list(self.stopped_positions.keys())
-        
+
         for symbol in reentry_symbols:
             if symbol in self.positions:
                 del self.stopped_positions[symbol]
                 continue
-            
+
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
-                
+
                 if not info or not info.get('regularMarketPrice'):
                     continue
-                
+
                 current_price = info['regularMarketPrice']
                 entry_price = self.stopped_positions[symbol]['entry_price']
-                
+
                 reentry_threshold = entry_price * (1 + REENTRY_BUFFER_PCT)
-                
+
                 if current_price >= reentry_threshold:
-                    # Check news safety before re-entry
                     if not self.scanner.check_news_safety(symbol):
                         logger.info(f"Re-entry blocked for {symbol} due to news safety filter.")
-                        # Optionally remove from stopped_positions so we don't keep checking?
-                        # Or keep it and wait for better news? 
-                        # Let's keep it for now, but maybe the user wants it removed if news is bad.
                         continue
 
                     allocation = cash * ALLOCATION_PERCENT
                     qty = int(allocation / current_price)
-                    
+
                     if qty <= 0:
                         logger.warning(f"Cannot re-enter {symbol}: allocation too small")
                         continue
-                    
+
                     result = self.alpaca.place_market_order(symbol, qty, "buy")
-                    
+
+                    if result is None:
+                        logger.error(f"Failed to place re-entry order for {symbol}")
+                        continue
+
+                    atr = self.strategy.get_atr(symbol)
+
                     self.positions[symbol] = {
                         'symbol': symbol,
                         'qty': qty,
@@ -1047,16 +1068,17 @@ class TradingBot:
                         'cost_basis': qty * current_price,
                         'unrealized_pl': 0,
                         'trailing_active': False,
-                        'peak_price': current_price
+                        'peak_price': current_price,
+                        'atr': atr
                     }
-                    
+
                     self.email.send_reentry_notification(symbol, qty, current_price, qty * current_price, entry_price)
-                    self.journal.log_reentry(symbol, qty, current_price)
-                    
+                    self.journal.log_reentry(symbol, qty, current_price, atr)
+
                     del self.stopped_positions[symbol]
-                    
-                    logger.info(f"Re-entered {symbol}: {qty} shares at ${current_price} (was exited at ${entry_price})")
-            
+
+                    logger.info(f"Re-entered {symbol}: {qty} shares at ${current_price}, ATR ${atr:.2f if atr else 'N/A'}")
+
             except Exception as e:
                 logger.error(f"Error checking re-entry for {symbol}: {e}")
                 continue
@@ -1128,7 +1150,7 @@ class TradingBot:
                 }
 
                 self.email.send_buy_notification(symbol, qty, current_price, qty * current_price)
-                self.journal.log_buy(symbol, qty, current_price)
+                self.journal.log_buy(symbol, qty, current_price, atr)
 
                 logger.info(f"Rebalanced: Opened {symbol} - {qty} shares at ${current_price}, ATR ${atr:.2f}")
 
