@@ -1,13 +1,1 @@
-ticket, quanity, bought_date, bought_price, sold_date, sold_price
-VRTX,7,20260413,443.29,,
-DE,5,20260413,600.65,20260415,575.00
-ELV,10,20260413,309.16,,
-BRK-B,7,20260415,476.60,,
-BRK-B,7,20260415,476.38,,
-BRK-B,7,20260415,476.11,,
-BRK-B,7,20260415,476.38,,
-BRK-B,7,20260415,476.34,,
-BRK-B,7,20260415,475.76,,
-BRK-B,7,20260415,475.42,,
-BRK-B,7,20260415,475.55,,
-AMAT,9,20260415,391.90,,
+ticket,quanity,bought_date,bought_price,sold_date,sold_price

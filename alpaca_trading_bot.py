@@ -2,10 +2,11 @@
 """
 Alpaca Auto-Trading Bot
 Automated trading script that:
-- Gets top 3 stocks from market scan
-- Allocates equal capital to each
-- Uses 2:1 R:R strategy (5% target, 2.5% stop)
-- Implements 2% trailing stop when profitable
+- Gets top 3 stocks from S&P 400 screener
+- Selects stocks by backtest scoring (avg/trade 2pts, win% 1pt, prof_factor 1pt)
+- Uses ATR-based exit (1 ATR stop loss, 2x ATR take profit)
+- Implements 5% trailing stop after hitting 2x ATR
+- Exits sideways stocks after 14 days within ±ATR range
 - Rotates positions daily during market hours
 - Sends email notifications on all trades
 """
@@ -43,6 +44,7 @@ from config import (
 from swing_trading_analyzer import MarketScanner, StockAnalyzer, TechnicalAnalyzer
 from news_fetcher import NewsFetcher
 from gemini_analyzer import GeminiAnalyzer
+import screener
 
 
 logging.basicConfig(
@@ -333,218 +335,256 @@ class AlpacaClient:
         return self._request("DELETE", f"/positions/{symbol}")
 
 
-class MarketScanReader:
+class ScreenerReader:
     def __init__(self):
-        self.ta = TechnicalAnalyzer()
         self.news_fetcher = NewsFetcher() if ENABLE_NEWS_FILTER else None
         try:
             self.gemini = GeminiAnalyzer() if ENABLE_NEWS_FILTER else None
         except Exception as e:
             logger.warning(f"Gemini AI not available for news filtering: {e}")
             self.gemini = None
-    
-    def run_scan(self, top_n=15):
-        logger.info(f"Running market scan for top {top_n} stocks...")
-        
-        from swing_trading_analyzer import MarketScanner, StockAnalyzer, SP500_TICKERS
-        
-        analyzer = StockAnalyzer(symbols=SP500_TICKERS[:50], period="1mo", interval="30m")
-        scanner = MarketScanner(analyzer)
-        
-        results = scanner.full_market_scan(top_n=top_n)
-        
-        logger.info(f"Scan complete: found {len(results['all_symbols'])} candidates")
-        
+
+    def run_screener(self, index='sp400'):
+        logger.info(f"Running screener for {index.upper()}...")
+        results = screener.run_screener(index)
         return results
-    
+
     def check_news_safety(self, symbol):
-        """Check if news is safe for trading this symbol"""
         if not ENABLE_NEWS_FILTER or not self.news_fetcher or not self.gemini:
             return True
-        
         logger.info(f"Checking news for {symbol}...")
         news = self.news_fetcher.get_stock_news(
             symbol, days=NEWS_DAYS_LOOKBACK, limit=NEWS_LIMIT_PER_STOCK
         )
-        
         if not news:
             logger.info(f"News Filter: No recent news for {symbol}, proceeding.")
             return True
-            
         formatted_news = self.news_fetcher.format_news_for_ai(news)
         analysis = self.gemini.analyze_news(symbol, formatted_news)
-        
         if not analysis.get('proceed', True):
             logger.info(f"News Filter: Skipping {symbol} due to negative news or upcoming events.")
-            logger.info(f"News Analysis Summary: {analysis.get('analysis').splitlines()[0]}...") # Log first line
             return False
-            
         logger.info(f"News Filter: {symbol} passed.")
         return True
-    
+
     def check_earnings_safe(self, symbol):
-        """Check if earnings date is too close (within 2 weeks)"""
         import io
         import sys
         from datetime import datetime, timezone
-        
         try:
             old_stderr = sys.stderr
             sys.stderr = io.StringIO()
-            
             ticker = yf.Ticker(symbol)
             earnings = ticker.earnings_dates
-            
             sys.stderr = old_stderr
-            
             if earnings is None or len(earnings) == 0:
                 return True
-            
             now = datetime.now(timezone.utc)
-            
             for date in earnings.index:
                 days_until = (date.replace(tzinfo=timezone.utc) - now).days
-                
                 if 0 <= days_until <= EARNINGS_LOOKAHEAD_DAYS:
                     logger.info(f"Earnings Filter: Skipping {symbol} - earnings in {days_until} days")
                     return False
-            
             return True
-            
         except Exception as e:
             sys.stderr = old_stderr
             return True
 
-    def get_top_buy_stocks(self, top_n=3):
-        results = self.run_scan(top_n=TOP_N_STOCKS * 5)
-        
-        candidates = []
-        from swing_trading_analyzer import StockAnalyzer
-        analyzer = StockAnalyzer(symbols=[], period="1mo", interval="30m")
-        
-        for symbol in results.get('all_symbols', []):
-            try:
-                # Perform technical analysis to confirm BUY signal
-                analysis = analyzer.analyze_stock(symbol)
-                if not analysis:
-                    continue
-                
-                rec = analysis['recommendation']
-                # Only consider stocks with BUY or STRONG BUY signals
-                if rec['recommendation'] not in ["BUY", "STRONG BUY"]:
-                    continue
+    def score_stocks(self, results):
+        def calc_score(stock):
+            bt = stock.get('backtest', {})
+            win_rate = bt.get('win_rate', 0) or 0
+            avg_trade = bt.get('avg_return_per_trade', 0) or 0
+            prof_factor = bt.get('profit_factor', 0) or 0
+            return {
+                'symbol': stock['ticker'],
+                'price': stock['price'],
+                'atr': stock.get('atr'),
+                'win_rate': win_rate,
+                'avg_trade': avg_trade,
+                'prof_factor': prof_factor,
+                'total_trades': bt.get('total_trades', 0),
+                'signal': stock.get('signal')
+            }
 
-                ticker = yf.Ticker(symbol)
-                info = ticker.info
-                
-                if info.get('regularMarketPrice') and info.get('regularMarketPrice') > 1:
-                    current_price = info.get('regularMarketPrice')
-                    
-                    # News Filter
-                    if not self.check_news_safety(symbol):
-                        continue
-                    
-                    # Earnings Filter - skip if earnings within 2 weeks
-                    if not self.check_earnings_safe(symbol):
-                        continue
-                    
-                    candidates.append({
-                        'symbol': symbol,
-                        'price': current_price,
-                        'volume': info.get('volume', 0),
-                        'strength': rec['strength'],
-                        'recommendation': rec['recommendation']
-                    })
+        scored = [calc_score(r) for r in results if r.get('backtest')]
+        if not scored:
+            return []
+
+        scored.sort(key=lambda x: x['avg_trade'], reverse=True)
+        for i, s in enumerate(scored):
+            if s['avg_trade'] is not None:
+                s['avg_trade_score'] = 2 if i == 0 else (1 if i == 1 else (0.5 if i == 2 else 0))
+            else:
+                s['avg_trade_score'] = 0
+
+        scored.sort(key=lambda x: x['win_rate'], reverse=True)
+        for i, s in enumerate(scored):
+            if s['win_rate'] is not None and s['win_rate'] > 50:
+                s['win_rate_score'] = 1 if i == 0 else (0.5 if i == 1 else (0.25 if i == 2 else 0))
+            else:
+                s['win_rate_score'] = 0
+
+        scored.sort(key=lambda x: x['prof_factor'], reverse=True)
+        for i, s in enumerate(scored):
+            if s['prof_factor'] is not None:
+                s['prof_factor_score'] = 1 if i == 0 else (0.5 if i == 1 else (0.25 if i == 2 else 0))
+            else:
+                s['prof_factor_score'] = 0
+
+        for s in scored:
+            s['total_score'] = s.get('avg_trade_score', 0) + s.get('win_rate_score', 0) + s.get('prof_factor_score', 0)
+
+        scored.sort(key=lambda x: x['total_score'], reverse=True)
+        return scored
+
+    def get_top_buy_stocks(self, top_n=3):
+        logger.info("Running S&P 400 screener...")
+        from screener import get_sp400_tickers, get_stock_data, init_db, analyze_stock
+        try:
+            conn = init_db()
+            tickers = get_sp400_tickers()
+            logger.info(f"Screening {len(tickers)} S&P 400 stocks...")
+        except Exception as e:
+            logger.error(f"Failed to get S&P 400 tickers: {e}")
+            return []
+
+        candidates = []
+        for i, ticker in enumerate(tickers):
+            if (i + 1) % 50 == 0:
+                logger.info(f"Screener progress: {i+1}/{len(tickers)} | candidates so far: {len(candidates)}")
+            try:
+                data = get_stock_data(ticker, conn)
+                if not data:
+                    continue
+                result = analyze_stock(ticker, data)
+                if not result:
+                    continue
+                sig = result.get('signal', '')
+                if sig not in ('BUY', 'STRONG BUY'):
+                    continue
+                if result.get('win_rate', 0) <= 50:
+                    logger.debug(f"Skipping {ticker}: win rate {result.get('win_rate')}% <= 50%")
+                    continue
+                candidates.append(result)
             except Exception as e:
-                logger.debug(f"Could not fetch/analyze {symbol}: {e}")
+                logger.debug(f"Error processing {ticker}: {e}")
                 continue
-        
-        # Sort by signal strength first, then volume
-        candidates.sort(key=lambda x: (x['strength'], x['volume']), reverse=True)
-        
-        top_stocks = candidates[:top_n]
-        
-        logger.info(f"Selected top {len(top_stocks)} stocks: {[s['symbol'] for s in top_stocks]}")
-        
+
+        conn.close()
+        logger.info(f"Screener found {len(candidates)} passing stocks")
+
+        if not candidates:
+            logger.warning("No stocks passed screener criteria")
+            return []
+
+        scored = self.score_stocks(candidates)
+        top_stocks = scored[:top_n]
+
+        for s in top_stocks:
+            logger.info(
+                f"Selected: {s['symbol']} | Score: {s['total_score']:.2f} | "
+                f"Win%: {s['win_rate']}% | Avg/Trade: {s['avg_trade']:.2f}% | PF: {s['prof_factor']:.2f}"
+            )
+
         return top_stocks
 
 
-class TradingStrategy:
+class ATRTradingStrategy:
+    TAKE_PROFIT_MULT = 2.0
+    TRAIL_STOP_PCT = 0.05
+    MAX_HOLDING_DAYS = 14
+
     def __init__(self):
-        self.take_profit_pct = TAKE_PROFIT_PCT
-        self.stop_loss_pct = STOP_LOSS_PCT
-        self.trail_stop_pct = TRAIL_STOP_PCT
-        self.trail_activation_pct = TRAIL_ACTIVATION_PCT
-    
+        pass
+
     def calculate_position_sizes(self, cash, stock_prices):
         total_capital = cash * len(stock_prices)
         sizes = []
-        
         for price in stock_prices:
             qty = int((total_capital / len(stock_prices)) / price)
             qty = (qty // 1) * 1
             sizes.append(max(1, qty))
-        
         return sizes
-    
-    def get_exit_prices(self, entry_price):
-        take_profit = entry_price * (1 + self.take_profit_pct)
-        stop_loss = entry_price * (1 - self.stop_loss_pct)
-        
-        return {
-            'entry': entry_price,
-            'take_profit': take_profit,
-            'stop_loss': stop_loss
-        }
-    
-    def should_exit(self, symbol, current_price, entry_price, peak_price, current_position, journal):
-        entry = entry_price
-        pnl_pct = (current_price - entry) / entry
-        
-        # Stop Loss (Hard exit)
-        if pnl_pct <= -self.stop_loss_pct:
-            return True, "Stop Loss"
-        
-        # Trailing Stop logic
+
+    def get_atr(self, symbol):
+        try:
+            from screener import calculate_atr
+            stock = yf.Ticker(symbol)
+            hist = stock.history(period='3mo', auto_adjust=False)
+            if hist.empty or len(hist) < 20:
+                return None
+            atr = calculate_atr(hist['High'], hist['Low'], hist['Close'])
+            return atr
+        except Exception as e:
+            logger.debug(f"Failed to get ATR for {symbol}: {e}")
+            return None
+
+    def get_exit_prices(self, entry_price, atr):
+        if atr is None:
+            return {'entry': entry_price, 'stop_loss': entry_price * 0.95, 'take_profit': entry_price * 1.05}
+        stop_loss = entry_price - atr
+        take_profit = entry_price + (atr * self.TAKE_PROFIT_MULT)
+        return {'entry': entry_price, 'stop_loss': stop_loss, 'take_profit': take_profit}
+
+    def should_exit(self, symbol, current_price, entry_price, peak_price, current_position, journal, atr=None):
+        if atr is None:
+            return False, None
+        pnl_pct = (current_price - entry_price) / entry_price
+
+        stop_loss = entry_price - atr
+        if current_price <= stop_loss:
+            return True, f"Stop Loss (ATR: ${atr:.2f})"
+
         if current_position.get('trailing_active', False):
-            trail_price = peak_price * (1 - self.trail_stop_pct)
+            trail_price = peak_price * (1 - self.TRAIL_STOP_PCT)
             if current_price <= trail_price:
                 return True, f"Trailing Stop (Profit: {pnl_pct*100:.2f}%)"
-        
-        # Time-based exit (max holding period) - use journal.csv for accurate holding days
+
+        take_profit_target = entry_price + (atr * self.TAKE_PROFIT_MULT)
+        if current_price >= take_profit_target and not current_position.get('trailing_active'):
+            current_position['trailing_active'] = True
+            current_position['peak_price'] = current_price
+            logger.info(f"Take profit target hit for {symbol} - activating 5% trailing stop")
+
         bought_dt = journal.get_bought_date(symbol)
         if bought_dt:
             now = datetime.now()
             if bought_dt.tzinfo is not None:
                 now = datetime.now(timezone.utc)
             holding_days = (now - bought_dt.replace(tzinfo=None)).days
-            
-            if holding_days >= MAX_HOLDING_DAYS:
-                return True, f"Max Hold Time ({holding_days} days)"
-        
-        # If we hit take profit but trailing isn't active yet, 
-        # normally we'd exit, but user wants trailing past 5%.
-        # The activate_trailing method handles setting trailing_active.
-        
+
+            if holding_days >= self.MAX_HOLDING_DAYS:
+                in_range = entry_price - atr <= current_price <= entry_price + atr
+                if in_range:
+                    return True, f"Sideways Exit ({holding_days} days, within ±ATR)"
+                else:
+                    return True, f"Max Hold Time ({holding_days} days)"
+
         return False, None
-    
-    def activate_trailing(self, current_price, entry_price, position_data):
-        pnl_pct = (current_price - entry_price) / entry_price
-        
-        if pnl_pct >= self.trail_activation_pct:
+
+    def activate_trailing(self, current_price, entry_price, position_data, atr=None):
+        if atr is None:
+            return position_data
+        take_profit_target = entry_price + (atr * self.TAKE_PROFIT_MULT)
+        if current_price >= take_profit_target:
             position_data['trailing_active'] = True
             position_data['peak_price'] = max(
                 position_data.get('peak_price', current_price),
                 current_price
             )
-        
         return position_data
+
+
+class TradingStrategy(ATRTradingStrategy):
+    def __init__(self):
+        super().__init__()
 
 
 class TradingBot:
     def __init__(self):
         self.alpaca = AlpacaClient()
-        self.scanner = MarketScanReader()
+        self.scanner = ScreenerReader()
         self.strategy = TradingStrategy()
         self.email = EmailNotifier()
         self.journal = JournalLogger()
@@ -657,7 +697,8 @@ class TradingBot:
                 'unrealized_pl': float(pos.get('unrealized_pl', 0)),
                 'trailing_active': False,
                 'peak_price': float(pos.get('current_price', 0)),
-                'entry_time': pos.get('opened_at')
+                'entry_time': pos.get('opened_at'),
+                'atr': pos.get('atr')
             }
     
     def close_all_positions(self):
@@ -743,38 +784,42 @@ class TradingBot:
         
         # Each stock should get ALLOCATION_PERCENT of the portfolio
         target_per_stock = portfolio_value * ALLOCATION_PERCENT
-        
+
         stock_data = []
-        
+
         for symbol in symbols_to_buy:
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
-                
-                if info and info.get('regularMarketPrice'):
+                atr = self.strategy.get_atr(symbol)
+
+                if info and info.get('regularMarketPrice') and atr:
                     stock_data.append({
                         'symbol': symbol,
-                        'price': info['regularMarketPrice']
+                        'price': info['regularMarketPrice'],
+                        'atr': atr
                     })
             except Exception as e:
-                logger.error(f"Failed to get price for {symbol}: {e}")
+                logger.error(f"Failed to get price/ATR for {symbol}: {e}")
                 continue
-        
+
+        if not stock_data:
+            logger.warning("No valid stock data for positions")
+            return
+
         for stock in stock_data:
             symbol = stock['symbol']
             price = stock['price']
-            
-            # Check if we have enough cash for this specific allocation
+            atr = stock['atr']
+
             allocation = min(target_per_stock, cash / len(stock_data))
-            
             qty = int(allocation / price)
-            
+
             if qty <= 0:
-                logger.warning(f"Cannot buy {symbol}: allocation too small (Target: ${allocation:.2f}, Price: ${price:.2f})")
                 continue
-            
+
             result = self.alpaca.place_market_order(symbol, qty, "buy")
-            
+
             self.positions[symbol] = {
                 'symbol': symbol,
                 'qty': qty,
@@ -785,13 +830,14 @@ class TradingBot:
                 'unrealized_pl': 0,
                 'trailing_active': False,
                 'peak_price': price,
-                'entry_time': datetime.now(timezone.utc).isoformat()
+                'entry_time': datetime.now(timezone.utc).isoformat(),
+                'atr': atr
             }
-            
+
             self.email.send_buy_notification(symbol, qty, price, qty * price)
             self.journal.log_buy(symbol, qty, price)
-            
-            logger.info(f"Opened {symbol}: {qty} shares at ${price}")
+
+            logger.info(f"Opened {symbol}: {qty} shares at ${price}, ATR ${atr:.2f}")
     
     def rotate_positions(self):
         logger.info("Running daily position rotation...")
@@ -885,36 +931,41 @@ class TradingBot:
     
     def monitor_positions(self):
         logger.info("Monitoring positions...")
-        
+
         self.load_positions()
-        
+
         if not self.positions:
             logger.info("No open positions")
             return
-        
+
         for symbol, pos in list(self.positions.items()):
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
-                
+
                 if not info or not info.get('regularMarketPrice'):
                     continue
-                
+
                 current_price = info['regularMarketPrice']
-                
+
                 pos['current_price'] = current_price
                 pos['market_value'] = pos['qty'] * current_price
-                
+
                 peak = pos.get('peak_price', current_price)
                 if current_price > peak:
                     pos['peak_price'] = current_price
-                
+
+                atr = pos.get('atr')
+                if atr is None:
+                    atr = self.strategy.get_atr(symbol)
+                    pos['atr'] = atr
+
                 self.strategy.activate_trailing(
-                    current_price, pos['avg_entry_price'], pos
+                    current_price, pos['avg_entry_price'], pos, atr
                 )
-                
+
                 should_exit, reason = self.strategy.should_exit(
-                    symbol, current_price, pos['avg_entry_price'], pos['peak_price'], pos, self.journal
+                    symbol, current_price, pos['avg_entry_price'], pos['peak_price'], pos, self.journal, atr
                 )
                 
                 if should_exit:
