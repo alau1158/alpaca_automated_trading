@@ -1,12 +1,12 @@
 #!/bin/bash
-# Setup script for Swing Trading Analyzer
+# Setup script for Alpaca Auto-Trading Bot
 
-echo "Setting up Swing Trading Stock Analyzer..."
-echo "=========================================="
+echo "Setting up Alpaca Auto-Trading Bot..."
+echo "=================================="
 
 # Check if Python is installed
 if ! command -v python3 &> /dev/null; then
-    echo "Error: Python 3 is not installed. Please install Python 3.8 or higher."
+    echo "Error: Python 3 is not installed. Please install Python 3.9 or higher."
     exit 1
 fi
 
@@ -31,10 +31,20 @@ pip install --upgrade pip
 echo "Installing required packages..."
 pip install -r requirements.txt
 
+# Create .env from template if it doesn't exist
+if [ ! -f ".env" ]; then
+    echo "Creating .env file from template..."
+    cp env_template .env
+    echo "Please edit .env with your API keys"
+fi
+
 echo ""
-echo "=========================================="
+echo "=================================="
 echo "Setup complete!"
-echo "To run the analyzer:"
+echo ""
+echo "To run the trading bot:"
 echo "  source venv/bin/activate"
-echo "  python swing_trading_analyzer.py"
-echo "=========================================="
+echo "  python3 alpaca_trading_bot.py"
+echo ""
+echo "To configure live trading, edit config.py or .env"
+echo "=================================="
