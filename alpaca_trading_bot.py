@@ -840,50 +840,28 @@ class TradingBot:
             logger.info(f"Opened {symbol}: {qty} shares at ${price}, ATR ${atr:.2f}")
     
     def rotate_positions(self):
-        logger.info("Running daily position rotation...")
-        
-        closed_symbols, failed_symbols = self.close_all_positions()
-        
-        # Reload positions to see what actually closed
+        logger.info("Running daily position rebalancing...")
+
         self.load_positions()
-        
-        # Get positions that were held more than one day
-        # Use journal.csv to determine holding period since API may have issues
-        positions_held_overnight = {}
-        for sym, pos in self.positions.items():
-            bought_dt = self.journal.get_bought_date(sym)
-            if bought_dt:
-                bought_date = bought_dt.date() if hasattr(bought_dt, 'date') else bought_dt
-                held_days = (datetime.now().date() - bought_date).days
-                if held_days >= 1:
-                    positions_held_overnight[sym] = pos
-            else:
-                # No journal entry, check API entry_time
-                if not self._was_opened_today(pos):
-                    positions_held_overnight[sym] = pos
-        
-        # Close was attempted for positions held overnight
-        # Reload positions from API to get current state
-        self.load_positions()
-        
-        # Remove closed positions from our tracking
-        for sym in closed_symbols:
-            if sym in self.positions:
-                del self.positions[sym]
-        
-        # Proceed with rotation - positions held overnight should be closed now
-        # Even if API hasn't updated yet, the close order was sent
-        logger.info(f"Proceeding with rotation. Previously held positions: {list(positions_held_overnight.keys())}")
-        
-        top_stocks = self.scanner.get_top_buy_stocks(top_n=TOP_N_STOCKS)
-        
-        symbols = [s['symbol'] for s in top_stocks]
-        
-        self.open_positions(symbols)
-        
+
+        current_count = len(self.positions)
+        if current_count >= TOP_N_STOCKS:
+            logger.info(f"Already have {current_count} positions - no rotation needed")
+            self.last_rotation_date = datetime.now().date()
+            return
+
+        if current_count == 0:
+            logger.info("No positions - opening new set")
+            top_stocks = self.scanner.get_top_buy_stocks(top_n=TOP_N_STOCKS)
+            symbols = [s['symbol'] for s in top_stocks]
+            self.open_positions(symbols)
+        else:
+            needed = TOP_N_STOCKS - current_count
+            logger.info(f"Have {current_count} position(s), filling {needed} more")
+            self.rebalance_positions()
+
         self.last_rotation_date = datetime.now().date()
-        
-        logger.info(f"Rotation complete. New positions: {symbols}")
+        logger.info(f"Rotation complete. Total positions: {len(self.positions)}")
     
     def _was_opened_today(self, pos):
         """Check if position was opened today"""
@@ -1086,54 +1064,55 @@ class TradingBot:
     def rebalance_positions(self):
         if not self.is_market_open():
             return
-        
+
         if len(self.positions) >= TOP_N_STOCKS:
             return
-        
+
         needed = TOP_N_STOCKS - len(self.positions)
-        logger.info(f"Rebalancing: need {needed} more stock(s) to reach {TOP_N_STOCKS}")
-        
+        logger.info(f"Rebalancing: have {len(self.positions)}, need {needed} more to reach {TOP_N_STOCKS}")
+
         cash, portfolio_value = self.get_account_info()
         if not cash or cash <= 0:
             logger.warning("No cash for rebalancing")
             return
-        
+
         top_stocks = self.scanner.get_top_buy_stocks(top_n=needed + len(self.positions))
-        
+
         available_symbols = [s['symbol'] for s in top_stocks if s['symbol'] not in self.positions]
-        
         symbols_to_buy = available_symbols[:needed]
-        
+
         if not symbols_to_buy:
             logger.warning("No new stocks available for rebalancing")
             return
-        
+
         for symbol in symbols_to_buy:
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
-                
-                if not info or not info.get('regularMarketPrice'):
+                atr = self.strategy.get_atr(symbol)
+
+                if not info or not info.get('regularMarketPrice') or not atr:
+                    logger.debug(f"Skipping {symbol}: no price/ATR")
                     continue
-                
+
                 current_price = info['regularMarketPrice']
-                
-                # Check news safety before rebalancing buy
+
                 if not self.scanner.check_news_safety(symbol):
                     continue
 
-                qty = int(cash / current_price)
-                
+                allocation = min(portfolio_value * ALLOCATION_PERCENT, cash)
+                qty = int(allocation / current_price)
+
                 if qty <= 0:
-                    logger.warning(f"Cannot buy {symbol}: insufficient funds (${cash:.2f}, price: ${current_price:.2f})")
+                    logger.warning(f"Cannot buy {symbol}: insufficient funds")
                     continue
-                
+
                 result = self.alpaca.place_market_order(symbol, qty, "buy")
-                
+
                 if result is None:
                     logger.error(f"Failed to place order for {symbol}")
                     continue
-                
+
                 self.positions[symbol] = {
                     'symbol': symbol,
                     'qty': qty,
@@ -1143,19 +1122,21 @@ class TradingBot:
                     'cost_basis': qty * current_price,
                     'unrealized_pl': 0,
                     'trailing_active': False,
-                    'peak_price': current_price
+                    'peak_price': current_price,
+                    'entry_time': datetime.now(timezone.utc).isoformat(),
+                    'atr': atr
                 }
-                
+
                 self.email.send_buy_notification(symbol, qty, current_price, qty * current_price)
                 self.journal.log_buy(symbol, qty, current_price)
-                
-                logger.info(f"Rebalanced: Opened {symbol} - {qty} shares at ${current_price}")
-                
+
+                logger.info(f"Rebalanced: Opened {symbol} - {qty} shares at ${current_price}, ATR ${atr:.2f}")
+
                 cash -= qty * current_price
-                
+
                 if len(self.positions) >= TOP_N_STOCKS:
                     break
-            
+
             except Exception as e:
                 logger.error(f"Error rebalancing {symbol}: {e}")
                 continue
