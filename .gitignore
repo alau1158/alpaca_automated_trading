@@ -25,3 +25,16 @@ Thumbs.db
 
 # Log files
 .log
+*.log
+trading_log.txt
+
+# Session files
+session-*.md
+
+# Pycache
+__pycache__/
+
+# Personal data
+journal.csv
+test_news_filter.py
+STRATEGY_REFINE_LOG.md
