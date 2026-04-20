@@ -826,12 +826,13 @@ class TradingBot:
             logger.warning("No valid stock data for positions")
             return
 
-        for stock in stock_data:
+        for i, stock in enumerate(stock_data):
             symbol = stock['symbol']
             price = stock['price']
             atr = stock['atr']
 
-            allocation = min(target_per_stock, cash / len(stock_data))
+            remaining = len(stock_data) - i
+            allocation = min(target_per_stock, cash / remaining)
             qty = int(allocation / price)
 
             if qty <= 0:
@@ -857,6 +858,8 @@ class TradingBot:
             self.journal.log_buy(symbol, qty, price, atr)
 
             logger.info(f"Opened {symbol}: {qty} shares at ${price}, ATR ${atr:.2f}")
+
+            cash -= qty * price
     
     def rotate_positions(self):
         logger.info("Running daily position rebalancing...")
@@ -1097,6 +1100,8 @@ class TradingBot:
             return
 
         needed = TOP_N_STOCKS - len(self.positions)
+        if needed <= 0:
+            return
         logger.info(f"Rebalancing: have {len(self.positions)}, need {needed} more to reach {TOP_N_STOCKS}")
 
         cash, portfolio_value = self.get_account_info()
@@ -1113,7 +1118,12 @@ class TradingBot:
             logger.warning("No new stocks available for rebalancing")
             return
 
-        for symbol in symbols_to_buy:
+        for i, symbol in enumerate(symbols_to_buy):
+            remaining_to_buy = needed - i
+            if remaining_to_buy <= 0:
+                break
+
+            allocation = cash / remaining_to_buy
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
@@ -1128,7 +1138,6 @@ class TradingBot:
                 if not self.scanner.check_news_safety(symbol):
                     continue
 
-                allocation = min(portfolio_value * ALLOCATION_PERCENT, cash)
                 qty = int(allocation / current_price)
 
                 if qty <= 0:

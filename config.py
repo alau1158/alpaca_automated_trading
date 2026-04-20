@@ -17,7 +17,7 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 EMAIL_RECIPIENTS = [e.strip() for e in os.environ.get("EMAIL_RECIPIENTS", "").split(",") if e.strip()]
 
 TOP_N_STOCKS = 3
-ALLOCATION_PERCENT = 1.0
+ALLOCATION_PERCENT = 0.333
 
 TAKE_PROFIT_PCT = 0.05
 STOP_LOSS_PCT = 0.025
