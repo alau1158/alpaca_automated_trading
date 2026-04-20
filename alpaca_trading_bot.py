@@ -498,7 +498,7 @@ class ScreenerReader:
 
 class ATRTradingStrategy:
     TAKE_PROFIT_MULT = 2.0
-    TRAIL_STOP_PCT = 0.05
+    TRAIL_STOP_PCT = 0.02
     MAX_HOLDING_DAYS = 14
 
     def __init__(self):
@@ -551,7 +551,7 @@ class ATRTradingStrategy:
         if current_price >= take_profit_target and not current_position.get('trailing_active'):
             current_position['trailing_active'] = True
             current_position['peak_price'] = current_price
-            logger.info(f"Take profit target hit for {symbol} - activating 5% trailing stop")
+            logger.info(f"Take profit target hit for {symbol} - activating {self.TRAIL_STOP_PCT*100:.0f}% trailing stop")
 
         bought_dt = journal.get_bought_date(symbol)
         if bought_dt:
@@ -561,11 +561,12 @@ class ATRTradingStrategy:
             holding_days = (now - bought_dt.replace(tzinfo=None)).days
 
             if holding_days >= self.MAX_HOLDING_DAYS:
-                in_range = entry_price - atr <= current_price <= entry_price + atr
-                if in_range:
-                    return True, f"Sideways Exit ({holding_days} days, within ±ATR)"
+                uptrend_threshold = entry_price + (atr * 2)
+                if current_price >= uptrend_threshold:
+                    logger.info(f"{symbol}: Above +{self.TAKE_PROFIT_MULT}x ATR threshold ({pnl_pct*100:.2f}%) - letting it run")
+                    return False, None
                 else:
-                    return True, f"Max Hold Time ({holding_days} days)"
+                    return True, f"Max Hold Time ({holding_days} days, {pnl_pct*100:.2f}%)"
 
         return False, None
 
@@ -748,6 +749,11 @@ class TradingBot:
             
             logger.info(f"Closing position {symbol} (held overnight: {entry_date is None or (entry_date is not None and entry_date < datetime.now(timezone.utc).date())})")
             result = self.alpaca.close_position(symbol)
+
+            if result is None:
+                logger.error(f"Failed to close position {symbol} - API returned error")
+                failed_symbols.append(symbol)
+                continue
 
             entry_price = pos['avg_entry_price']
             exit_price = pos['current_price']
