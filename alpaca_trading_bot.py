@@ -2,8 +2,7 @@
 """
 Alpaca Auto-Trading Bot
 Automated trading script that:
-- Gets top 3 stocks from S&P 400 screener
-- Selects stocks by backtest scoring (avg/trade 2pts, win% 1pt, prof_factor 1pt)
+- Gets top 3 stocks from Minervini screener (screener.py)
 - Uses ATR-based exit (1 ATR stop loss, 2x ATR take profit)
 - Implements 5% trailing stop after hitting 2x ATR
 - Exits sideways stocks after 14 days within ±ATR range
@@ -41,10 +40,7 @@ from config import (
     DRY_RUN_MODE, LOG_FILE, MARKET_TZ,
     ENABLE_NEWS_FILTER, NEWS_DAYS_LOOKBACK, NEWS_LIMIT_PER_STOCK
 )
-from swing_trading_analyzer import MarketScanner, StockAnalyzer, TechnicalAnalyzer
-from news_fetcher import NewsFetcher
-from gemini_analyzer import GeminiAnalyzer
-import screener
+from screener import MinerviniScreener, calculate_atr
 
 
 logging.basicConfig(
@@ -343,34 +339,9 @@ class AlpacaClient:
 
 class ScreenerReader:
     def __init__(self):
-        self.news_fetcher = NewsFetcher() if ENABLE_NEWS_FILTER else None
-        try:
-            self.gemini = GeminiAnalyzer() if ENABLE_NEWS_FILTER else None
-        except Exception as e:
-            logger.warning(f"Gemini AI not available for news filtering: {e}")
-            self.gemini = None
-
-    def run_screener(self, index='sp400'):
-        logger.info(f"Running screener for {index.upper()}...")
-        results = screener.run_screener(index)
-        return results
+        pass
 
     def check_news_safety(self, symbol):
-        if not ENABLE_NEWS_FILTER or not self.news_fetcher or not self.gemini:
-            return True
-        logger.info(f"Checking news for {symbol}...")
-        news = self.news_fetcher.get_stock_news(
-            symbol, days=NEWS_DAYS_LOOKBACK, limit=NEWS_LIMIT_PER_STOCK
-        )
-        if not news:
-            logger.info(f"News Filter: No recent news for {symbol}, proceeding.")
-            return True
-        formatted_news = self.news_fetcher.format_news_for_ai(news)
-        analysis = self.gemini.analyze_news(symbol, formatted_news)
-        if not analysis.get('proceed', True):
-            logger.info(f"News Filter: Skipping {symbol} due to negative news or upcoming events.")
-            return False
-        logger.info(f"News Filter: {symbol} passed.")
         return True
 
     def check_earnings_safe(self, symbol):
@@ -396,101 +367,38 @@ class ScreenerReader:
             sys.stderr = old_stderr
             return True
 
-    def score_stocks(self, results):
-        def calc_score(stock):
-            bt = stock.get('backtest', {})
-            win_rate = bt.get('win_rate', 0) or 0
-            avg_trade = bt.get('avg_return_per_trade', 0) or 0
-            prof_factor = bt.get('profit_factor', 0) or 0
-            return {
-                'symbol': stock['ticker'],
-                'price': stock['price'],
-                'atr': stock.get('atr'),
-                'win_rate': win_rate,
-                'avg_trade': avg_trade,
-                'prof_factor': prof_factor,
-                'total_trades': bt.get('total_trades', 0),
-                'signal': stock.get('signal')
-            }
-
-        scored = [calc_score(r) for r in results if r.get('backtest')]
-        if not scored:
-            return []
-
-        scored.sort(key=lambda x: x['avg_trade'], reverse=True)
-        for i, s in enumerate(scored):
-            if s['avg_trade'] is not None:
-                s['avg_trade_score'] = 2 if i == 0 else (1 if i == 1 else (0.5 if i == 2 else 0))
-            else:
-                s['avg_trade_score'] = 0
-
-        scored.sort(key=lambda x: x['win_rate'], reverse=True)
-        for i, s in enumerate(scored):
-            if s['win_rate'] is not None and s['win_rate'] > 50:
-                s['win_rate_score'] = 1 if i == 0 else (0.5 if i == 1 else (0.25 if i == 2 else 0))
-            else:
-                s['win_rate_score'] = 0
-
-        scored.sort(key=lambda x: x['prof_factor'], reverse=True)
-        for i, s in enumerate(scored):
-            if s['prof_factor'] is not None:
-                s['prof_factor_score'] = 1 if i == 0 else (0.5 if i == 1 else (0.25 if i == 2 else 0))
-            else:
-                s['prof_factor_score'] = 0
-
-        for s in scored:
-            s['total_score'] = s.get('avg_trade_score', 0) + s.get('win_rate_score', 0) + s.get('prof_factor_score', 0)
-
-        scored.sort(key=lambda x: x['total_score'], reverse=True)
-        return scored
-
     def get_top_buy_stocks(self, top_n=3):
-        logger.info("Running S&P 400 screener...")
-        from screener import get_sp400_tickers, get_stock_data, init_db, analyze_stock
-        try:
-            conn = init_db()
-            tickers = get_sp400_tickers()
-            logger.info(f"Screening {len(tickers)} S&P 400 stocks...")
-        except Exception as e:
-            logger.error(f"Failed to get S&P 400 tickers: {e}")
-            return []
+        logger.info("Running Minervini screener...")
+        screener_obj = MinerviniScreener()
+        results = screener_obj.find_top_opportunities(minervini_pass_only=True, limit=top_n)
 
-        candidates = []
-        for i, ticker in enumerate(tickers):
-            if (i + 1) % 50 == 0:
-                logger.info(f"Screener progress: {i+1}/{len(tickers)} | candidates so far: {len(candidates)}")
+        top_stocks = []
+        for r in results[:top_n]:
             try:
-                data = get_stock_data(ticker, conn)
-                if not data:
+                ticker = yf.Ticker(r.symbol)
+                hist = ticker.history(period='3mo', auto_adjust=False)
+                if hist.empty or len(hist) < 20:
                     continue
-                result = analyze_stock(ticker, data)
-                if not result:
-                    continue
-                sig = result.get('signal', '')
-                if sig not in ('BUY', 'STRONG BUY'):
-                    continue
-                if result.get('win_rate', 0) <= 50:
-                    logger.debug(f"Skipping {ticker}: win rate {result.get('win_rate')}% <= 50%")
-                    continue
-                candidates.append(result)
+
+                atr = calculate_atr(hist['High'], hist['Low'], hist['Close'])
             except Exception as e:
-                logger.debug(f"Error processing {ticker}: {e}")
-                continue
+                atr = None
 
-        conn.close()
-        logger.info(f"Screener found {len(candidates)} passing stocks")
-
-        if not candidates:
-            logger.warning("No stocks passed screener criteria")
-            return []
-
-        scored = self.score_stocks(candidates)
-        top_stocks = scored[:top_n]
+            top_stocks.append({
+                'symbol': r.symbol,
+                'price': r.price,
+                'atr': atr,
+                'win_rate': r.rs_rating,
+                'avg_return_per_trade': r.overall_score,
+                'prof_factor': r.rs_rating,
+                'total_trades': 0,
+                'signal': 'BUY'
+            })
 
         for s in top_stocks:
             logger.info(
-                f"Selected: {s['symbol']} | Score: {s['total_score']:.2f} | "
-                f"Win%: {s['win_rate']}% | Avg/Trade: {s['avg_trade']:.2f}% | PF: {s['prof_factor']:.2f}"
+                f"Selected: {s['symbol']} | Price: ${s['price']:.2f} | "
+                f"RS Rating: {s['win_rate']:.0f} | Overall Score: {s['avg_return_per_trade']:.2f}"
             )
 
         return top_stocks

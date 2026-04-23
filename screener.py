@@ -1,784 +1,447 @@
-import os
-import sys
-import smtplib
-import logging
-import sqlite3
-import warnings
-import argparse
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
-from typing import Optional
-
-import dotenv
-import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from tabulate import tabulate
+from scipy.stats import percentileofscore
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
+import logging
 
-warnings.filterwarnings('ignore')
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CACHE_DB = 'screener_cache.db'
-DEFAULT_DAYS_TO_GET = 400   # Extra history needed for backtesting
-STAGE1_MONTHS = 3
-STAGE2_DAYS = 30
-STAGE3_LOOKBACK = 20        # 20-day avg volume window
-VOLUME_SURGE_MULT = 1.0     # 100% of avg = at least equal to avg
-RANGE_TOLERANCE = 0.30      # 30% max price range over 30 days
-BACKTEST_HOLD_DAYS = 10     # 2-week swing (trading days)
-BACKTEST_STOP_LOSS = 0.07   # 7% stop loss
-BACKTEST_LOOKBACK_DAYS = 252  # ~1 year of backtest signals
+
+def calculate_atr(high, low, close, period=14):
+    """Calculate Average True Range"""
+    high_low = high - low
+    high_close = np.abs(high - close.shift())
+    low_close = np.abs(low - close.shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    atr = true_range.rolling(period).mean().iloc[-1]
+    return float(atr)
 
 
-# ─────────────────────────────────────────
-# ENV / DB
-# ─────────────────────────────────────────
+@dataclass
+class StockAnalysis:
+    symbol: str
+    name: str
+    price: float
+    change_pct: float
+    volume: int
+    ma_50: float
+    ma_150: float
+    ma_200: float
+    ma_200_trending_up: bool      # BUGFIX: store the real value from analyze_stock
+    price_52wk_high: float
+    price_52wk_low: float
+    eps: Optional[float]
+    pe_ratio: Optional[float]
+    eps_growth: Optional[float]
+    revenue_growth: Optional[float]
+    rs_raw_perf: float        # FIX #2: raw weighted performance for percentile ranking
+    rs_rating: float          # FIX #2: true percentile rank, set after all stocks are scored
+    trend_score: int
+    trend_requirements: Dict  # expose which criteria passed/failed for auditing
+    fundamental_score: int
+    overall_score: float
+    signals: List[str]
+    minervini_passed: bool    # FIX #3: explicit hard pass/fail flag
+    # New fields for entry points, earnings, and catalysts
+    next_earnings_date: Optional[str] = None
+    recent_news: List[str] = None
+    entry_zone: Optional[str] = None
+    entry_price: Optional[float] = None
+    catalyst: Optional[str] = None
 
-def load_env():
-    dotenv.load_dotenv()
-    return {
-        'smtp_server': os.getenv('SMTP_SERVER'),
-        'smtp_port': int(os.getenv('SMTP_PORT', 587)),
-        'email_user': os.getenv('EMAIL_USER'),
-        'email_password': os.getenv('EMAIL_PASSWORD'),
-        'recipients': os.getenv('RECIPIENT_EMAILS', '').replace('\n', ',').split(',')
-    }
 
-def init_db():
-    conn = sqlite3.connect(CACHE_DB)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS stock_cache (
-            ticker TEXT PRIMARY KEY,
-            data_json TEXT,
-            updated_at TEXT
-        )
-    ''')
-    conn.commit()
-    return conn
+class MinerviniScreener:
 
+    # ---------------------------------------------------------------------------
+    # Moving averages
+    # ---------------------------------------------------------------------------
+    def _calculate_moving_averages(self, data: pd.DataFrame) -> Dict:
+        data = data.sort_index()
+        close = data['Close']
 
-# ─────────────────────────────────────────
-# DATA FETCHING
-# ─────────────────────────────────────────
+        ma50  = close.rolling(window=50).mean().iloc[-1]
+        ma150 = close.rolling(window=150).mean().iloc[-1]
+        ma200_series = close.rolling(window=200).mean()
+        ma200 = ma200_series.iloc[-1]
 
-def get_sp500_tickers() -> list:
-    return _get_wiki_tickers('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', 'S&P 500')
+        # FIX #1 (partial): 200-MA trend check still uses 22 trading days — correct
+        ma200_22d_ago = ma200_series.iloc[-22] if len(ma200_series) > 22 else ma200
+        ma200_trending_up = bool(ma200 > ma200_22d_ago)
 
-def get_sp400_tickers() -> list:
-    return _get_wiki_tickers('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies', 'S&P 400')
+        return {
+            'ma_50': float(ma50),
+            'ma_150': float(ma150),
+            'ma_200': float(ma200),
+            'ma_200_trending_up': ma200_trending_up,
+        }
 
-def _get_wiki_tickers(url: str, name: str) -> list:
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        tables = pd.read_html(resp.text)
-        tickers = tables[0]['Symbol'].tolist()
-        tickers = [t.replace('.', '-') for t in tickers if pd.notna(t)]
-        logger.info(f'Fetched {len(tickers)} {name} tickers')
-        return tickers
-    except Exception as e:
-        logger.error(f'Failed to fetch {name} tickers: {e}')
-        sys.exit(1)
+    def _identify_entry_zone(
+        self,
+        current_price: float,
+        high_52wk: float,
+        low_52wk: float,
+        ma_50: float,
+        ma_150: float,
+        ma_200: float,
+        ma_200_trending_up: bool,
+    ) -> Tuple[Optional[str], Optional[float]]:
+        pct_from_high = ((high_52wk - current_price) / high_52wk) * 100
+        pct_from_low = ((current_price - low_52wk) / low_52wk) * 100
 
-def get_stock_data(ticker: str, conn: sqlite3.Connection, retry_count: int = 0) -> Optional[dict]:
-    max_retries = 2
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period=f'{DEFAULT_DAYS_TO_GET}d', auto_adjust=False)
-        if hist.empty:
-            return None
-        info = stock.info
+        ma_stack_aligned = ma_50 > ma_150 > ma_200
+
+        if pct_from_high <= 5 and ma_stack_aligned:
+            return "base_breakout", current_price
+        elif pct_from_high <= 15 and ma_stack_aligned and pct_from_low >= 25:
+            return "tight_consolidation", current_price
+        elif ma_stack_aligned and ma_200_trending_up:
+            if abs(current_price - ma_50) / ma_50 <= 0.03:
+                return "at_50ma_pullback", ma_50
+            elif abs(current_price - ma_150) / ma_150 <= 0.03:
+                return "at_150ma_pullback", ma_150
+        return None, None
+
+    # ---------------------------------------------------------------------------
+    # FIX #2 — RS rating: return raw weighted performance only.
+    #           True percentile rank is assigned AFTER all stocks are scored.
+    # ---------------------------------------------------------------------------
+    def _get_rs_raw_performance(self, sp500_data: pd.DataFrame, stock_data: pd.DataFrame) -> float:
+        """
+        Weighted relative performance vs S&P 500.
+        Weights: 40% (3 m), 20% (6 m), 20% (9 m), 20% (12 m)
+        Returns the raw outperformance figure — NOT a 1-99 score yet.
+        """
         try:
-            calendar = stock.calendar
+            def get_return(data: pd.DataFrame, days: int) -> float:
+                if len(data) < days + 1:
+                    return 0.0
+                return float((data['Close'].iloc[-1] / data['Close'].iloc[-(days + 1)]) - 1)
+
+            periods = [63, 126, 189, 252]   # ~3, 6, 9, 12 months
+            weights = [0.4, 0.2, 0.2, 0.2]
+
+            stock_perf = sum(get_return(stock_data, p) * w for p, w in zip(periods, weights))
+            sp_perf    = sum(get_return(sp500_data,  p) * w for p, w in zip(periods, weights))
+
+            return stock_perf - sp_perf     # raw outperformance vs index
         except Exception:
-            calendar = None
-        return {'history': hist, 'info': info, 'calendar': calendar}
-    except Exception as e:
-        if 'Too Many Requests' in str(e) and retry_count < max_retries:
-            import time
-            time.sleep(2 ** retry_count)
-            return get_stock_data(ticker, conn, retry_count + 1)
-        logger.debug(f'Failed to get data for {ticker}: {e}')
-        return None
-
-def get_earnings_date(calendar) -> str:
-    if not calendar:
-        return 'N/A'
-    dates = calendar.get('Earnings Date', [])
-    return str(dates[0]) if dates else 'N/A'
-
-def get_ex_dividend(calendar) -> str:
-    if not calendar:
-        return 'N/A'
-    ex_div = calendar.get('Ex-Dividend Date', None)
-    return str(ex_div) if ex_div else 'N/A'
-
-
-# ─────────────────────────────────────────
-# INDICATOR CALCULATIONS
-# ─────────────────────────────────────────
-
-def calculate_sma(prices: pd.Series, period: int) -> float:
-    if len(prices) < period:
-        return np.nan
-    return prices.iloc[-period:].mean()
-
-def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
-    """
-    FIX: Original used simple average for RSI — not the standard Wilder smoothing.
-    Standard RSI uses Wilder's smoothed moving average (EMA with alpha=1/period).
-    This fix gives results consistent with TradingView, Thinkorswim, etc.
-    """
-    if len(prices) < period + 1:
-        return np.nan
-    delta = prices.diff().dropna()
-    gains = delta.clip(lower=0)
-    losses = (-delta).clip(lower=0)
-    # Wilder smoothing (equivalent to EMA with alpha = 1/period)
-    avg_gain = gains.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
-    avg_loss = losses.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
-
-def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
-    if len(close) < period + 1:
-        return np.nan
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    return round(tr.iloc[-period:].mean(), 2)
-
-def calculate_bollinger_bands(prices: pd.Series, period: int = 20) -> dict:
-    if len(prices) < period:
-        return {'upper': np.nan, 'middle': np.nan, 'lower': np.nan}
-    sma = prices.iloc[-period:].mean()
-    std = prices.iloc[-period:].std()
-    return {
-        'upper': round(sma + 2 * std, 2),
-        'middle': round(sma, 2),
-        'lower': round(sma - 2 * std, 2)
-    }
-
-def calculate_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
-    if len(prices) < slow + signal:
-        return {'macd': np.nan, 'signal': np.nan, 'histogram': np.nan}
-    ema_fast = prices.ewm(span=fast, adjust=False).mean()
-    ema_slow = prices.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return {
-        'macd': round(macd_line.iloc[-1], 4),
-        'signal': round(signal_line.iloc[-1], 4),
-        'histogram': round((macd_line - signal_line).iloc[-1], 4)
-    }
-
-def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
-                          k_period: int = 14, d_period: int = 3) -> dict:
-    if len(close) < k_period:
-        return {'k': np.nan, 'd': np.nan}
-    lowest_low = low.rolling(window=k_period).min()
-    highest_high = high.rolling(window=k_period).max()
-    denom = highest_high - lowest_low
-    k = 100 * ((close - lowest_low) / denom.replace(0, np.nan))
-    d = k.rolling(window=d_period).mean()
-    return {'k': round(k.iloc[-1], 2), 'd': round(d.iloc[-1], 2)}
-
-
-# ─────────────────────────────────────────
-# SIGNAL SCORING
-# ─────────────────────────────────────────
-
-def calculate_buy_signal(rsi: float, macd: float, macd_signal: float,
-                          stoch_k: float, price: float,
-                          bb_upper: float, bb_lower: float) -> tuple[str, int]:
-    """
-    Returns (signal_label, score).
-
-    FIXES vs original:
-    1. RSI thresholds were out of order — >85 check must come BEFORE >75 check,
-       otherwise >85 always falls into the >75 branch and never gets -2.
-    2. Stochastic >60 branch was added in original but is NOT in the stated strategy.
-       Removed it — only the three stated conditions apply: >80, <20, <40.
-    3. Score thresholds aligned to match stated strategy table:
-       STRONG BUY ≥3, BUY ≥1, HOLD =0, SELL ≥-1, STRONG SELL <-1
-       (original used ≥4 / ≥2 which made STRONG BUY nearly impossible).
-    """
-    score = 0
-    any_nan = any(pd.isna(v) for v in [rsi, macd, macd_signal, stoch_k, bb_upper, bb_lower])
-    if not any_nan:
-        # RSI — for breakout stocks, overbought is expected, not penalized
-        # Removing oversold check (RSI < 45) since breakout at 30-day high can't be oversold
-        if rsi > 85:
-            score -= 1  # Reduced from -2: extremely overbought still has some risk
-        elif rsi > 70:
-            score -= 0.5  # Slightly overbought is fine for momentum
-        # No penalty for RSI 45-70 (neutral zone)
-        # No reward for RSI < 45 (unreachable for breakouts anyway)
-
-        # MACD
-        if macd > macd_signal:
-            score += 2
-        elif macd < macd_signal - 0.5:
-            score -= 1
-
-        # Stochastic — momentum confirmation
-        if stoch_k > 80:
-            score += 1  # Strong momentum, not overbought in this context
-        # Removed: stoch_k < 20 (oversold impossible at breakout)
-        # Removed: stoch_k < 40 (too harsh for momentum plays)
-
-        # Bollinger Bands — reward riding the upper band (momentum confirmation)
-        if price > bb_upper:
-            score += 1  # Strong breakout, riding upper band is bullish
-        elif price > bb_upper * 0.95:
-            score += 1  # Near upper band = good momentum
-        elif price < bb_lower:
-            score -= 1  # Below lower band = mean reversion, not momentum
-
-    if score >= 3:
-        return "STRONG BUY", score
-    elif score >= 1:
-        return "BUY", score
-    elif score == 0:
-        return "HOLD", score
-    elif score >= -1:
-        return "SELL", score
-    else:
-        return "STRONG SELL", score
-
-
-# ─────────────────────────────────────────
-# STAGE FILTERS (applied to a given date window)
-# ─────────────────────────────────────────
-
-def run_stages(hist_clean: pd.DataFrame, as_of_idx: int) -> Optional[dict]:
-    """
-    Run all 3 stage filters as of a specific bar index.
-    Returns a dict of computed values, or None if any stage fails.
-    This is used for both live screening and backtesting.
-    """
-    if as_of_idx < 200:
-        return None
-
-    window = hist_clean.iloc[:as_of_idx + 1]
-    closes = window['Close']
-    highs = window['High']
-    lows = window['Low']
-    volumes = window['Volume']
-
-    current_price = closes.iloc[-1]
-
-    # ── Stage 1: Trend Filter ──
-    end_date = window.index[-1]
-    start_3m = end_date - timedelta(days=int(STAGE1_MONTHS * 30))
-    hist_3m = window[window.index >= start_3m]
-    if len(hist_3m) < 20:
-        return None
-
-    price_3m_ago = hist_3m['Close'].iloc[0]
-    return_3m = (current_price / price_3m_ago - 1) * 100
-    sma_200 = closes.iloc[-200:].mean()
-    above_200 = current_price > sma_200
-
-    if return_3m < 20 or not above_200:
-        return None
-
-    # ── Stage 2: Setup Filter ──
-    start_30d = end_date - timedelta(days=STAGE2_DAYS + 10)
-    hist_30d = window[window.index >= start_30d].iloc[-STAGE2_DAYS:]
-    if len(hist_30d) < 15:
-        return None
-
-    high_30d = hist_30d['Close'].max()
-    low_30d = hist_30d['Close'].min()
-    range_pct = (high_30d - low_30d) / high_30d
-
-    if range_pct > RANGE_TOLERANCE:
-        return None
-
-    # ── Stage 3: Breakout Trigger ──
-    breakout = current_price >= high_30d  # at or above 30-day high
-
-    vol_avg = volumes.iloc[-STAGE3_LOOKBACK:].mean()
-    today_vol = volumes.iloc[-1]
-    volume_surge = today_vol >= (vol_avg * VOLUME_SURGE_MULT)
-
-    if not breakout or not volume_surge:
-        return None
-
-    # ── Indicators (last 60 bars of current window) ──
-    ind_close = closes.iloc[-60:]
-    ind_high = highs.iloc[-60:]
-    ind_low = lows.iloc[-60:]
-
-    rsi = calculate_rsi(ind_close)
-    atr = calculate_atr(ind_high, ind_low, ind_close)
-    bb = calculate_bollinger_bands(ind_close)
-    macd = calculate_macd(ind_close)
-    stoch = calculate_stochastic(ind_high, ind_low, ind_close)
-
-    signal, score = calculate_buy_signal(
-        rsi, macd['macd'], macd['signal'],
-        stoch['k'], current_price, bb['upper'], bb['lower']
-    )
-
-    return {
-        'price': round(current_price, 2),
-        'return_3m': round(return_3m, 2),
-        'volume_surge': round(today_vol / vol_avg, 2),
-        'atr': atr,
-        'rsi': rsi,
-        'macd': macd['histogram'],
-        'stoch_k': stoch['k'],
-        'bb_upper': bb['upper'],
-        'signal': signal,
-        'score': score,
-    }
-
-
-# ─────────────────────────────────────────
-# BACKTEST
-# ─────────────────────────────────────────
-
-def backtest_ticker(hist_clean: pd.DataFrame, ticker: str) -> list:
-    """
-    Walk-forward backtest: for each trading day in the backtest window,
-    run the full 3-stage filter. On a BUY/STRONG BUY signal, simulate
-    entry at next-day open and exit at:
-      - 10 trading days later (time stop), OR
-      - 7% stop loss (whichever comes first).
-    Resumes scanning the day after each trade exits, allowing multiple
-    trades per ticker over the backtest window.
-    Returns a list of trade dicts.
-    """
-    closes = hist_clean['Close']
-    opens = hist_clean['Open']
-    n = len(hist_clean)
-    trades = []
-    # Start after enough history for all indicators (200-day SMA + 60-bar indicators)
-    start_i = max(220, n - BACKTEST_LOOKBACK_DAYS - BACKTEST_HOLD_DAYS - 5)
-    # Don't scan the last HOLD_DAYS bars — not enough room to complete a trade
-    end_i = n - BACKTEST_HOLD_DAYS - 1
-
-    i = start_i
-    while i < end_i:
-        result = run_stages(hist_clean, i)
-        if result is None or result['signal'] not in ('BUY', 'STRONG BUY'):
-            i += 1
-            continue
-
-        # Entry: next-day open (realistic — can't buy at the signal close)
-        entry_idx = i + 1
-        if entry_idx >= n:
-            break
-        entry_date = hist_clean.index[entry_idx]
-        entry_price = opens.iloc[entry_idx]
-        stop_price = entry_price * (1 - BACKTEST_STOP_LOSS)
-
-        exit_price = None
-        exit_date = None
-        exit_reason = None
-        exit_idx = entry_idx  # track where trade ends so we resume after it
-
-        # Simulate each day of the hold period
-        for j in range(1, BACKTEST_HOLD_DAYS + 1):
-            idx = entry_idx + j
-            if idx >= n:
-                break
-            day_low = hist_clean['Low'].iloc[idx]
-            day_close = closes.iloc[idx]
-            exit_idx = idx
-
-            if day_low <= stop_price:
-                exit_price = stop_price
-                exit_date = hist_clean.index[idx]
-                exit_reason = 'stop_loss'
-                break
-
-            if j == BACKTEST_HOLD_DAYS:
-                exit_price = day_close
-                exit_date = hist_clean.index[idx]
-                exit_reason = 'time_exit'
-
-        if exit_price is not None:
-            pnl_pct = (exit_price / entry_price - 1) * 100
-            trades.append({
-                'ticker': ticker,
-                'signal': result['signal'],
-                'entry_date': str(entry_date.date()),
-                'exit_date': str(exit_date.date()),
-                'entry_price': round(entry_price, 2),
-                'exit_price': round(exit_price, 2),
-                'pnl_pct': round(pnl_pct, 2),
-                'exit_reason': exit_reason,
-                'score': result['score'],
-            })
-
-        # Resume scanning the day after this trade exited
-        i = exit_idx + 1
-
-    return trades
-
-def compute_backtest_summary(trades: list) -> dict:
-    if not trades:
-        return {}
-    df = pd.DataFrame(trades)
-    wins = df[df['pnl_pct'] > 0]
-    losses = df[df['pnl_pct'] <= 0]
-    win_rate = len(wins) / len(df) * 100
-    avg_win = wins['pnl_pct'].mean() if len(wins) else 0
-    avg_loss = losses['pnl_pct'].mean() if len(losses) else 0
-    gross_profit = wins['pnl_pct'].sum()
-    gross_loss = abs(losses['pnl_pct'].sum())
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-
-    # Simple drawdown approximation from cumulative P&L
-    cumulative = df['pnl_pct'].cumsum()
-    rolling_max = cumulative.cummax()
-    drawdown = cumulative - rolling_max
-    max_drawdown = drawdown.min()
-
-    strong_buy_trades = df[df['signal'] == 'STRONG BUY']
-    buy_trades = df[df['signal'] == 'BUY']
-
-    return {
-        'total_trades': len(df),
-        'win_rate': round(win_rate, 1),
-        'avg_win': round(avg_win, 2),
-        'avg_loss': round(avg_loss, 2),
-        'profit_factor': round(profit_factor, 2),
-        'total_return': round(df['pnl_pct'].sum(), 2),
-        'avg_return_per_trade': round(df['pnl_pct'].mean(), 2),
-        'max_drawdown': round(max_drawdown, 2),
-        'stop_loss_exits': int((df['exit_reason'] == 'stop_loss').sum()),
-        'time_exits': int((df['exit_reason'] == 'time_exit').sum()),
-        'strong_buy_win_rate': round(
-            len(strong_buy_trades[strong_buy_trades['pnl_pct'] > 0]) / len(strong_buy_trades) * 100, 1
-        ) if len(strong_buy_trades) else None,
-        'buy_win_rate': round(
-            len(buy_trades[buy_trades['pnl_pct'] > 0]) / len(buy_trades) * 100, 1
-        ) if len(buy_trades) else None,
-        'trades': df.sort_values('entry_date').to_dict('records'),
-    }
-
-
-# ─────────────────────────────────────────
-# LIVE ANALYSIS
-# ─────────────────────────────────────────
-
-def analyze_stock(ticker: str, data: dict) -> Optional[dict]:
-    hist = data['history']
-    if hist.empty or len(hist) < 200:
-        return None
-
-    try:
-        hist_clean = hist.copy()
-        hist_clean.index = hist_clean.index.tz_convert(None)
-    except Exception:
-        hist_clean = hist.copy()
-
-    result = run_stages(hist_clean, len(hist_clean) - 1)
-    if result is None:
-        return None
-
-    # Run backtest on this ticker's history
-    bt_trades = backtest_ticker(hist_clean, ticker)
-    bt_summary = compute_backtest_summary(bt_trades)
-
-    calendar = data.get('calendar')
-    return {
-        'ticker': ticker,
-        **result,
-        'earnings_date': get_earnings_date(calendar),
-        'ex_dividend': get_ex_dividend(calendar),
-        'backtest': bt_summary,
-    }
-
-
-# ─────────────────────────────────────────
-# EMAIL REPORT
-# ─────────────────────────────────────────
-
-def build_html_report(results: list) -> str:
-    signal_color = {
-        'STRONG BUY': '#1a7f37',
-        'BUY': '#2563eb',
-        'HOLD': '#92400e',
-        'SELL': '#b91c1c',
-        'STRONG SELL': '#7f1d1d',
-    }
-    signal_bg = {
-        'STRONG BUY': '#dcfce7',
-        'BUY': '#dbeafe',
-        'HOLD': '#fef3c7',
-        'SELL': '#fee2e2',
-        'STRONG SELL': '#fecaca',
-    }
-
-    rows = ''
-    for r in results:
-        bt = r.get('backtest', {})
-        sig = r['signal']
-        pf = bt.get('profit_factor', None)
-        pf_str = f"{pf:.2f}" if pf and pf != float('inf') else ('∞' if pf == float('inf') else 'N/A')
-        win_str = f"{bt.get('win_rate', 'N/A')}%" if bt else 'N/A'
-        trades_str = str(bt.get('total_trades', 'N/A')) if bt else 'N/A'
-        avg_ret = bt.get('avg_return_per_trade', None)
-        avg_ret_str = f"{avg_ret:+.2f}%" if avg_ret is not None else 'N/A'
-        dd_str = f"{bt.get('max_drawdown', 'N/A')}%" if bt else 'N/A'
-
-        rows += f"""
-        <tr>
-          <td style="font-weight:600;padding:8px 12px;">{r['ticker']}</td>
-          <td style="padding:8px 12px;">${r['price']}</td>
-          <td style="padding:8px 12px;">{r['return_3m']}%</td>
-          <td style="padding:8px 12px;">{r['volume_surge']:.1f}x</td>
-          <td style="padding:8px 12px;">${r['atr']}</td>
-          <td style="padding:8px 12px;">
-            <span style="background:{signal_bg.get(sig,'#f3f4f6')};color:{signal_color.get(sig,'#111')};
-              padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;">{sig}</span>
-          </td>
-          <td style="padding:8px 12px;">{int(r['score']):+d}</td>
-          <td style="padding:8px 12px;">{trades_str}</td>
-          <td style="padding:8px 12px;">{win_str}</td>
-          <td style="padding:8px 12px;">{avg_ret_str}</td>
-          <td style="padding:8px 12px;">{pf_str}</td>
-          <td style="padding:8px 12px;">{dd_str}</td>
-          <td style="padding:8px 12px;font-size:12px;color:#6b7280;">{r['earnings_date']}</td>
-          <td style="padding:8px 12px;font-size:12px;color:#6b7280;">{r['ex_dividend']}</td>
-        </tr>"""
-
-    all_trades = []
-    for r in results:
-        bt = r.get('backtest', {})
-        all_trades.extend(bt.get('trades', []))
-    agg = compute_backtest_summary(all_trades) if all_trades else {}
-
-    agg_html = ''
-    if agg:
-        agg_html = f"""
-        <h3 style="margin:24px 0 8px;color:#111827;">Backtest Summary (Past ~12 Months, All Signals)</h3>
-        <table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px;margin-bottom:24px;">
-          <tr>
-            <td style="padding:6px 20px 6px 0;color:#6b7280;">Total trades</td>
-            <td style="padding:6px 0;font-weight:600;">{agg.get('total_trades','N/A')}</td>
-            <td style="padding:6px 20px 6px 30px;color:#6b7280;">Win rate</td>
-            <td style="padding:6px 0;font-weight:600;">{agg.get('win_rate','N/A')}%</td>
-          </tr>
-          <tr>
-            <td style="padding:6px 20px 6px 0;color:#6b7280;">Avg win</td>
-            <td style="padding:6px 0;font-weight:600;color:#1a7f37;">+{agg.get('avg_win','N/A')}%</td>
-            <td style="padding:6px 20px 6px 30px;color:#6b7280;">Avg loss</td>
-            <td style="padding:6px 0;font-weight:600;color:#b91c1c;">{agg.get('avg_loss','N/A')}%</td>
-          </tr>
-          <tr>
-            <td style="padding:6px 20px 6px 0;color:#6b7280;">Profit factor</td>
-            <td style="padding:6px 0;font-weight:600;">{agg.get('profit_factor','N/A')}</td>
-            <td style="padding:6px 20px 6px 30px;color:#6b7280;">Max drawdown</td>
-            <td style="padding:6px 0;font-weight:600;color:#b91c1c;">{agg.get('max_drawdown','N/A')}%</td>
-          </tr>
-          <tr>
-            <td style="padding:6px 20px 6px 0;color:#6b7280;">Stop-loss exits</td>
-            <td style="padding:6px 0;font-weight:600;">{agg.get('stop_loss_exits','N/A')}</td>
-            <td style="padding:6px 20px 6px 30px;color:#6b7280;">Time exits</td>
-            <td style="padding:6px 0;font-weight:600;">{agg.get('time_exits','N/A')}</td>
-          </tr>
-          <tr>
-            <td style="padding:6px 20px 6px 0;color:#6b7280;">STRONG BUY win rate</td>
-            <td style="padding:6px 0;font-weight:600;">{str(agg.get('strong_buy_win_rate','N/A'))+'%' if agg.get('strong_buy_win_rate') is not None else 'N/A'}</td>
-            <td style="padding:6px 20px 6px 30px;color:#6b7280;">BUY win rate</td>
-            <td style="padding:6px 0;font-weight:600;">{str(agg.get('buy_win_rate','N/A'))+'%' if agg.get('buy_win_rate') is not None else 'N/A'}</td>
-          </tr>
-        </table>"""
-
-    return f"""
-    <div style="font-family:Arial,sans-serif;color:#111827;">
-      <p style="color:#6b7280;font-size:13px;">
-        Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp;
-        Strategy: 3-month momentum breakout &nbsp;|&nbsp;
-        Backtest: ~12 months walk-forward, 10-day hold, 7% stop-loss
-      </p>
-
-      {agg_html}
-
-      <h3 style="margin:24px 0 8px;color:#111827;">Today's Signals</h3>
-      <div style="overflow-x:auto;">
-      <table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;width:100%;">
-        <thead>
-          <tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb;">
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">Ticker</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">Price</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">3M Return</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">Vol Surge</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">ATR</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">Signal</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">Score</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">BT Trades</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">BT Win%</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">BT Avg/Trade</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">BT Prof.Factor</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">BT MaxDD</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">Earnings</th>
-            <th style="padding:10px 12px;text-align:left;white-space:nowrap;">Ex-Div</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows}
-        </tbody>
-      </table>
-      </div>
-
-      <p style="margin-top:20px;font-size:11px;color:#9ca3af;">
-        BT = Backtest (past ~12 months). Past performance does not guarantee future results.
-        Stop-loss: {BACKTEST_STOP_LOSS*100:.0f}%. Hold period: {BACKTEST_HOLD_DAYS} trading days.
-        This is not financial advice.
-      </p>
-
-      <h4 style="margin:24px 0 8px;color:#111827;font-size:13px;">Backtest Metrics Explained</h4>
-      <p style="font-size:11px;color:#6b7280;line-height:1.5;">
-        <strong>BT Trades</strong> — how many times in the past ~12 months that stock triggered a BUY or STRONG BUY signal and a full trade was simulated. More trades = more confidence in the other numbers. If it says 2, the win rate is basically meaningless.<br><br>
-        <strong>BT Win%</strong> — out of those trades, what percentage were profitable when they exited (either after 10 days or at the 7% stop-loss). 50% = broke even on wins vs losses, 60%+ is decent for a swing strategy.<br><br>
-        <strong>BT Avg/Trade</strong> — the average profit or loss per trade as a percentage. This matters more than win rate alone — you could win 70% of trades but still lose money if your losses are huge. You want this to be a positive number.<br><br>
-        <strong>BT Prof.Factor</strong> — total profits divided by total losses across all trades. A score of 1.0 means you broke even, above 1.5 is generally considered good, above 2.0 is strong. For example, a profit factor of 1.8 means for every $1 lost, the strategy made $1.80.<br><br>
-        <strong>BT MaxDD</strong> — the worst peak-to-trough loss in the cumulative P&L during the backtest period. It answers "what's the worst run of bad trades I would have had to sit through?" A MaxDD of -15% means at some point your running total dropped 15% from its high before recovering.
-      </p>
-      <p style="margin-top:12px;font-size:11px;color:#9ca3af;">
-        The most important ones to look at together are Win% + Avg/Trade + Prof.Factor as a trio — a strategy can look good on any one of them individually but fall apart on the others.
-      </p>
-    </div>"""
-
-def send_email(config: dict, html_body: str, subject: str = 'Stock Screener Report'):
-    if not config['email_user'] or not config['email_password']:
-        logger.warning('Email not configured, skipping send')
-        return False
-
-    msg = MIMEMultipart('alternative')
-    msg['From'] = config['email_user']
-    msg['To'] = ', '.join(r for r in config['recipients'] if r)
-    msg['Subject'] = subject
-
-    full_html = f"""
-    <html><head><meta charset="utf-8"></head>
-    <body style="margin:0;padding:24px;background:#ffffff;">
-      <h2 style="font-family:Arial,sans-serif;color:#111827;margin:0 0 4px;">
-        Stock Screener Report
-      </h2>
-      {html_body}
-    </body></html>"""
-
-    msg.attach(MIMEText(full_html, 'html'))
-
-    try:
-        server = smtplib.SMTP(config['smtp_server'], config['smtp_port'])
-        server.starttls()
-        server.login(config['email_user'], config['email_password'])
-        server.sendmail(config['email_user'], config['recipients'], msg.as_string())
-        server.quit()
-        logger.info(f'Email sent to {len(config["recipients"])} recipients')
-        return True
-    except Exception as e:
-        logger.error(f'Failed to send email: {e}')
-        return False
-
-
-# ─────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────
-
-def run_screener(index: str = 'sp500'):
-    logger.info(f'Starting stock screener for {index.upper()}...')
-    config = load_env()
-    conn = init_db()
-
-    if index == 'sp400':
-        tickers = get_sp400_tickers()
-    else:
-        tickers = get_sp500_tickers()
-
-    logger.info(f'Screening {len(tickers)} stocks...')
-
-    failed_tickers = []
-    results = []
-
-    for i, ticker in enumerate(tickers):
-        if (i + 1) % 50 == 0:
-            logger.info(f'Progress: {i+1}/{len(tickers)} | signals so far: {len(results)}')
-
+            return 0.0
+
+    # ---------------------------------------------------------------------------
+    # FIX #3 — Trend template: strictly binary.  Score is informational only.
+    # FIX #6 — Denominator is now 8 (RS is handled separately, not double-counted).
+    # ---------------------------------------------------------------------------
+    def _check_trend_template(
+        self,
+        ma_data: Dict,
+        current_price: float,
+        high_52wk: float,
+        low_52wk: float,
+        rs_rating: float,           # passed in after percentile ranking
+    ) -> Tuple[bool, Dict, int]:
+
+        req: Dict[str, bool] = {}
+
+        # --- MA stack alignment (4 criteria) ---
+        req['price_above_50ma']    = current_price > ma_data['ma_50']
+        req['price_above_150ma']   = current_price > ma_data['ma_150']
+        req['price_above_200ma']   = current_price > ma_data['ma_200']
+        req['50ma_above_150_200']  = (
+            ma_data['ma_50'] > ma_data['ma_150'] and
+            ma_data['ma_50'] > ma_data['ma_200']
+        )
+        req['150ma_above_200ma']   = ma_data['ma_150'] > ma_data['ma_200']
+
+        # --- 200-MA trending up for at least 1 month ---
+        req['200ma_trending_up']   = ma_data['ma_200_trending_up']
+
+        # FIX #1 — proximity uses the TRUE 52-week window (set in analyze_stock)
+        distance_from_high = ((high_52wk - current_price) / high_52wk) * 100
+        req['within_25pct_of_high'] = distance_from_high <= 25
+
+        above_low_pct = ((current_price - low_52wk) / low_52wk) * 100
+        req['above_25pct_of_low']   = above_low_pct >= 25
+
+        # --- RS rating (8th criterion, counted once) ---
+        req['rs_rating_above_70']   = rs_rating >= 70
+
+        # FIX #6 — denominator is 9 criteria total (8 classic + RS = 9 here, but
+        #           RS is NOT double-counted in overall_score like it was before)
+        score = sum(1 for v in req.values() if v)
+
+        # FIX #3 — hard binary: ALL criteria must pass
+        all_passed = all(req.values())
+
+        return all_passed, req, score
+
+    # ---------------------------------------------------------------------------
+    # Per-stock analysis  (sp500_data passed in — FIX #4: fetched ONCE outside loop)
+    # ---------------------------------------------------------------------------
+    def analyze_stock(self, symbol: str, sp500_data: pd.DataFrame) -> Optional[StockAnalysis]:
         try:
-            data = get_stock_data(ticker, conn)
-            if not data:
-                failed_tickers.append(ticker)
-                continue
+            ticker = yf.Ticker(symbol)
+            info   = ticker.info
 
-            result = analyze_stock(ticker, data)
-            if result:
-                results.append(result)
-                bt = result.get('backtest', {})
-                logger.info(
-                    f"SIGNAL: {ticker} | {result['signal']} (score {result['score']:+d}) "
-                    f"| 3M: {result['return_3m']}% "
-                    f"| BT win%: {bt.get('win_rate','?')}% over {bt.get('total_trades','?')} trades"
-                )
+            hist = ticker.history(period="2y")
+            if len(hist) < 200:
+                logger.warning(f"Insufficient data for {symbol}")
+                return None
+
+            current_price = float(hist['Close'].iloc[-1])
+
+            # FIX #1 — 52-week high/low from LAST 252 TRADING DAYS only
+            hist_52wk = hist.iloc[-252:]
+            high_52wk = float(hist_52wk['High'].max())
+            low_52wk  = float(hist_52wk['Low'].min())
+
+            ma_data = self._calculate_moving_averages(hist)
+
+            # Raw RS performance (percentile assigned later in find_top_opportunities)
+            rs_raw = self._get_rs_raw_performance(sp500_data, hist)
+
+            eps             = info.get('epsTrailingTwelveMonths')
+            pe              = info.get('trailingPE')
+            eps_growth      = info.get('earningsQuarterlyGrowth')
+            revenue_growth  = info.get('revenueGrowth')
+
+            # FIX #5 — PE filter: skip PE check when EPS growth is exceptional (>40 %)
+            fundamental_score = 0
+            if eps and eps > 0:
+                fundamental_score += 1
+            if pe:
+                if eps_growth and eps_growth > 0.40:
+                    # High-growth stock — Minervini explicitly ignores PE in this case
+                    fundamental_score += 1
+                elif 0 < pe < 50:
+                    fundamental_score += 1
+            if eps_growth and eps_growth > 0.25:
+                fundamental_score += 1
+            if revenue_growth and revenue_growth > 0.25:
+                fundamental_score += 1
+
+            change_pct = (
+                ((current_price - float(hist['Close'].iloc[-2])) / float(hist['Close'].iloc[-2])) * 100
+                if len(hist) > 1 else 0.0
+            )
+
+            entry_zone, entry_price = self._identify_entry_zone(
+                current_price, high_52wk, low_52wk,
+                ma_data['ma_50'], ma_data['ma_150'], ma_data['ma_200'],
+                ma_data['ma_200_trending_up']
+            )
+
+            return StockAnalysis(
+                symbol=symbol.upper(),
+                name=info.get('shortName', symbol),
+                price=current_price,
+                change_pct=change_pct,
+                volume=info.get('volume', 0),
+                ma_50=ma_data['ma_50'],
+                ma_150=ma_data['ma_150'],
+                ma_200=ma_data['ma_200'],
+                ma_200_trending_up=ma_data['ma_200_trending_up'],  # BUGFIX: store real value
+                price_52wk_high=high_52wk,
+                price_52wk_low=low_52wk,
+                eps=eps,
+                pe_ratio=pe,
+                eps_growth=eps_growth,
+                revenue_growth=revenue_growth,
+                rs_raw_perf=rs_raw,
+                rs_rating=50.0,         # placeholder — set after percentile ranking
+                trend_score=0,          # placeholder — set after RS is finalised
+                trend_requirements={},  # placeholder
+                fundamental_score=fundamental_score,
+                overall_score=0.0,      # placeholder
+                signals=[],
+                minervini_passed=False, # placeholder
+                entry_zone=entry_zone,
+                entry_price=entry_price,
+            )
         except Exception as e:
-            logger.debug(f'Error processing {ticker}: {e}')
-            failed_tickers.append(ticker)
+            logger.error(f"Error analyzing {symbol}: {e}")
+            return None
 
-    logger.info(f'Screening complete. Signals: {len(results)} | Failed: {len(failed_tickers)}')
+    # ---------------------------------------------------------------------------
+    # FIX #2 — Percentile rank RS across ALL screened stocks, THEN score/filter
+    # FIX #3 — overall_score is 0 for any stock that fails the template
+    # FIX #4 — S&P 500 data fetched ONCE here, passed into every analyze_stock call
+    # ---------------------------------------------------------------------------
+    def screen_candidates(self, symbols: List[str]) -> List[StockAnalysis]:
+        # FIX #4: fetch S&P 500 data once
+        logger.info("Fetching S&P 500 benchmark data...")
+        sp500_data = yf.Ticker("^GSPC").history(period="2y")
 
-    if not results:
-        send_email(config, '<p>No stocks passed all screening criteria today.</p>',
-                   'Stock Screener — No Results')
-        print('No stocks found matching all criteria.')
-        conn.close()
-        return
+        results: List[StockAnalysis] = []
+        for symbol in symbols:
+            logger.info(f"Analyzing {symbol}...")
+            analysis = self.analyze_stock(symbol, sp500_data)
+            if analysis:
+                results.append(analysis)
 
-    # Sort: signal strength first, then 3M return descending
-    signal_order = {'STRONG BUY': 0, 'BUY': 1, 'HOLD': 2, 'SELL': 3, 'STRONG SELL': 4}
-    results.sort(key=lambda r: (signal_order.get(r['signal'], 9), -r['return_3m']))
+        if not results:
+            return results
 
-    # Console summary
-    table_data = [[
-        r['ticker'], f"${r['price']}", f"{r['return_3m']}%",
-        f"{r['volume_surge']:.1f}x", f"${r['atr']}", r['signal'],
-        f"{int(r['score']):+d}",
-        r['backtest'].get('win_rate', 'N/A'),
-        r['backtest'].get('total_trades', 'N/A'),
-        r['earnings_date'], r['ex_dividend']
-    ] for r in results]
+        # FIX #2 — true percentile rank now that we have all raw performances
+        all_raw_perfs = [r.rs_raw_perf for r in results]
+        for r in results:
+            r.rs_rating = float(percentileofscore(all_raw_perfs, r.rs_raw_perf, kind='rank'))
 
-    headers = ['Ticker', 'Price', '3M Ret%', 'Vol', 'ATR', 'Signal', 'Score',
-               'BT Win%', 'BT Trades', 'Earnings', 'Ex-Div']
-    print(tabulate(table_data, headers=headers, tablefmt='grid'))
+        # Now that RS ratings are finalised, run the trend template check & score
+        for r in results:
+            passed, req, score = self._check_trend_template(
+                ma_data={
+                    'ma_50': r.ma_50,
+                    'ma_150': r.ma_150,
+                    'ma_200': r.ma_200,
+                    'ma_200_trending_up': r.ma_200_trending_up,  # BUGFIX: use stored value
+                },
+                current_price=r.price,
+                high_52wk=r.price_52wk_high,
+                low_52wk=r.price_52wk_low,
+                rs_rating=r.rs_rating,
+            )
 
-    html_report = build_html_report(results)
-    send_email(config, html_report,
-               f'Stock Screener — {len(results)} Signal{"s" if len(results) != 1 else ""}')
+            r.minervini_passed    = passed
+            r.trend_score         = score
+            r.trend_requirements  = req
 
-    conn.close()
-    logger.info('Done.')
+            # Build human-readable signals
+            signals: List[str] = []
+            if passed:
+                signals.append("✅ MINERVINI TREND TEMPLATE PASSED")
+            else:
+                failed = [k for k, v in req.items() if not v]
+                signals.append(f"❌ Failed criteria: {', '.join(failed)}")
+
+            if score >= 7:
+                signals.append(f"Strong trend ({score}/9 criteria)")
+            if r.rs_rating >= 80:
+                signals.append(f"High relative strength (RS: {r.rs_rating:.0f})")
+            if req.get('200ma_trending_up'):
+                signals.append("200-day MA trending up")
+            if r.eps_growth and r.eps_growth > 0.4:
+                signals.append(f"Exceptional EPS growth ({r.eps_growth * 100:.0f}%)")
+
+            r.signals = signals
+
+            # FIX #3 — stocks that fail the template get overall_score = 0
+            # FIX #6 — RS contributes via its own term only (no double-count)
+            if passed:
+                r.overall_score = (
+                    (score / 9)           * 50 +   # trend (9 criteria, denominator=9)
+                    (r.fundamental_score / 4) * 30 + # fundamentals
+                    (r.rs_rating / 100)   * 20       # RS percentile
+                )
+            else:
+                r.overall_score = 0.0
+
+        # Sort: passing stocks first (by overall_score desc), then failures
+        results.sort(key=lambda x: x.overall_score, reverse=True)
+        return results
+
+    # ---------------------------------------------------------------------------
+    # S&P 500 symbol list helper
+    # ---------------------------------------------------------------------------
+    def _get_sp500_symbols(self) -> List[str]:
+        try:
+            import requests
+            from io import StringIO
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, timeout=10, headers=headers)
+            dfs = pd.read_html(StringIO(response.text))
+            symbols = dfs[0]['Symbol'].str.replace('.', '-', regex=False).tolist()
+            return symbols
+        except Exception as e:
+            logger.warning(f"Failed to fetch S&P 500 list: {e}, using fallback")
+            return [
+                'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'UNH', 'JNJ',
+                'V', 'XOM', 'JPM', 'PG', 'MA', 'HD', 'CVX', 'LLY', 'ABBV', 'MRK',
+                'AVGO', 'PEP', 'COST', 'KO', 'TMO', 'MCD', 'CSCO', 'ACN', 'WMT', 'DIS',
+                'GOOG', 'APH', 'DELL', 'MU',
+            ]
+
+    # ---------------------------------------------------------------------------
+    # Main entry point
+    # ---------------------------------------------------------------------------
+    def find_top_opportunities(self, minervini_pass_only: bool = True, limit: int = 10) -> List[StockAnalysis]:
+        logger.info("Fetching S&P 500 symbols...")
+        symbols = self._get_sp500_symbols()
+        logger.info(f"Loaded {len(symbols)} symbols")
+
+        results = self.screen_candidates(symbols)
+
+        if minervini_pass_only:
+            results = [r for r in results if r.minervini_passed]
+
+        return results[:limit]
+
+    # ---------------------------------------------------------------------------
+    # Convenience: audit a single stock with full breakdown (great for debugging)
+    # ---------------------------------------------------------------------------
+    def audit_stock(self, symbol: str) -> None:
+        """
+        Print a full pass/fail breakdown for a single stock.
+        Useful for verifying DELL, MSFT, etc. against the template manually.
+        """
+        sp500_data = yf.Ticker("^GSPC").history(period="2y")
+        result = self.analyze_stock(symbol, sp500_data)
+        if not result:
+            print(f"Could not fetch data for {symbol}")
+            return
+
+        # Assign a placeholder RS (we only have one stock, so percentile = 50)
+        result.rs_rating = 50.0
+
+        passed, req, score = self._check_trend_template(
+            ma_data={
+                'ma_50': result.ma_50,
+                'ma_150': result.ma_150,
+                'ma_200': result.ma_200,
+                'ma_200_trending_up': result.ma_200_trending_up,  # BUGFIX: use stored value
+            },
+            current_price=result.price,
+            high_52wk=result.price_52wk_high,
+            low_52wk=result.price_52wk_low,
+            rs_rating=result.rs_rating,
+        )
+
+        print(f"\n{'='*55}")
+        print(f"  MINERVINI AUDIT — {symbol.upper()}")
+        print(f"{'='*55}")
+        print(f"  Price      : ${result.price:.2f}")
+        print(f"  50-day MA  : ${result.ma_50:.2f}   (price {'>' if result.price > result.ma_50 else '<'} MA)")
+        print(f"  150-day MA : ${result.ma_150:.2f}   (price {'>' if result.price > result.ma_150 else '<'} MA)")
+        print(f"  200-day MA : ${result.ma_200:.2f}   (price {'>' if result.price > result.ma_200 else '<'} MA)")
+        print(f"  52wk High  : ${result.price_52wk_high:.2f}")
+        print(f"  52wk Low   : ${result.price_52wk_low:.2f}")
+        print(f"\n  Criteria breakdown:")
+        for criterion, value in req.items():
+            status = "✅" if value else "❌"
+            print(f"    {status}  {criterion}")
+        print(f"\n  Score      : {score}/9")
+        print(f"  RESULT     : {'✅ PASSED' if passed else '❌ FAILED'}")
+        print(f"{'='*55}\n")
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Stock Screener')
-    parser.add_argument('-sp500', action='store_true', help='Screen S&P 500 stocks (default)')
-    parser.add_argument('-sp400', action='store_true', help='Screen S&P 400 stocks')
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Quick-start
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    screener = MinerviniScreener()
 
-    if args.sp400:
-        index = 'sp400'
-    else:
-        index = 'sp500'
+    # Audit specific stocks to verify logic
+    for ticker in ["MU", "GOOG", "APH", "DELL", "MSFT"]:
+        screener.audit_stock(ticker)
 
-    run_screener(index)
+    # Full screen — only stocks passing ALL Minervini criteria
+    print("\nRunning full S&P 500 screen...\n")
+    top = screener.find_top_opportunities(minervini_pass_only=True, limit=10)
+    for i, s in enumerate(top, 1):
+        print(f"{i:2}. {s.symbol:<6}  Score: {s.overall_score:.1f}  RS: {s.rs_rating:.0f}  "
+              f"Price: ${s.price:.2f}  Signals: {'; '.join(s.signals)}")
